@@ -10,6 +10,50 @@ from .datasheet_hints import tag_response
 from ..config import get_config
 
 
+# Characters that indicate a designator was used to alias multiple package
+# pads onto a single schematic pin. This is a long-standing convention in
+# some Altium libraries but it BREAKS schematic↔footprint pin mapping —
+# each schematic pin must correspond to exactly one footprint pad so that
+# downstream PCB workflows (annotation, ECO, ECO-back, BOM, pick-and-place)
+# stay coherent. Reject these everywhere a designator enters the system.
+_INVALID_DESIGNATOR_CHARS = (",", ";", " ", "\t", "\n", "\r")
+
+
+def _validate_pin_designator(designator: Any, context: str = "pin") -> str:
+    """Enforce the 1-pin-per-pad invariant: one designator, no aliasing.
+
+    Each schematic pin must map 1:1 to a single footprint pad. Multi-pin
+    designator strings like ``"A4,A6,B1"`` (sometimes used to fold many
+    GND/VCC balls onto a single symbol pin) silently break footprint
+    binding — annotation can't unique-identify pads, ECO drifts, and the
+    PCB sees a different pin count than the schematic. Always split
+    grouped power/ground/NC pins into one symbol pin per package ball
+    even if it makes the symbol taller.
+
+    Returns the cleaned designator string. Raises InvalidParameterError
+    with a clear remediation message on violation.
+    """
+    if not isinstance(designator, str):
+        raise InvalidParameterError(
+            f"{context} designator must be a string, got "
+            f"{type(designator).__name__}"
+        )
+    cleaned = designator.strip()
+    if not cleaned:
+        raise InvalidParameterError(f"{context} designator is empty")
+    for ch in _INVALID_DESIGNATOR_CHARS:
+        if ch in cleaned:
+            display = repr(ch) if ch in (" ", "\t", "\n", "\r") else ch
+            raise InvalidParameterError(
+                f"{context} designator {cleaned!r} contains {display!r} — "
+                f"each schematic pin must map 1:1 to a single footprint "
+                f"pad, so multi-pin aliases (e.g. 'A4,A6,B1') are not "
+                f"allowed. Split grouped power/ground/NC pins into one "
+                f"symbol pin per package ball."
+            )
+    return cleaned
+
+
 def register_library_tools(mcp):
     """Register library tools with the MCP server."""
 
@@ -22,6 +66,7 @@ def register_library_tools(mcp):
         name: str,
         designator_prefix: str = "U",
         description: str = "",
+        part_count: int = 1,
     ) -> dict[str, Any]:
         """Create a new schematic symbol in the active library.
 
@@ -29,10 +74,19 @@ def register_library_tools(mcp):
             name: Component name
             designator_prefix: Default designator prefix (e.g., "U", "R", "C")
             description: Component description
+            part_count: Number of functional parts in this component. Use >1
+                for multi-part symbols (e.g., 4 for a quad op-amp). Pins and
+                shapes added afterwards take an ``owner_part_id``: 1..N picks
+                which part the primitive belongs to, and 0 marks it as shared
+                across all parts (the canonical pattern for VCC/GND on
+                multi-part chips). Set this at create time — bumping it later
+                will not redistribute existing pins.
 
         Returns:
             Dictionary with created symbol information
         """
+        if part_count < 1:
+            raise InvalidParameterError("part_count must be >= 1")
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "library.create_symbol",
@@ -40,6 +94,7 @@ def register_library_tools(mcp):
                 "name": name,
                 "designator_prefix": designator_prefix,
                 "description": description,
+                "part_count": part_count,
             },
         )
         return result
@@ -54,6 +109,7 @@ def register_library_tools(mcp):
         rotation: int = 0,
         electrical_type: str = "passive",
         hidden: bool = False,
+        owner_part_id: int = 1,
     ) -> dict[str, Any]:
         """Add a pin to the current symbol.
 
@@ -64,7 +120,12 @@ def register_library_tools(mcp):
         version does all pins in one PreProcess/PostProcess + one save.
 
         Args:
-            designator: Pin designator (e.g., "1", "2", "VCC")
+            designator: Pin designator — a single package-pad identifier
+                (e.g., "1", "2", "M11", "A4"). Comma-separated alias
+                strings ("A4,A6,B1") are REJECTED: each schematic pin
+                must map 1:1 to exactly one footprint pad. For BGAs
+                with many GND/VCC balls, call this once per ball with
+                the same ``name`` and unique designators.
             name: Pin name
             x: X coordinate in mils
             y: Y coordinate in mils
@@ -74,10 +135,19 @@ def register_library_tools(mcp):
                 - "input", "output", "bidirectional", "passive"
                 - "open_collector", "open_emitter", "power", "hiz"
             hidden: Whether to hide the pin
+            owner_part_id: Multi-part owner. 1..N picks which part the pin
+                belongs to (matches ``part_count`` on ``lib_create_symbol``).
+                ``0`` marks the pin as shared across all parts (the canonical
+                pattern for VCC/GND on multi-part chips). Default 1.
 
         Returns:
             Dictionary confirming pin addition
         """
+        if owner_part_id < 0:
+            raise InvalidParameterError("owner_part_id must be >= 0 (0 = shared)")
+        designator = _validate_pin_designator(
+            designator, context=f"pin {name!r}"
+        )
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "library.add_pin",
@@ -90,6 +160,7 @@ def register_library_tools(mcp):
                 "rotation": rotation,
                 "electrical_type": electrical_type,
                 "hidden": hidden,
+                "owner_part_id": owner_part_id,
             },
         )
         hint = BulkHintTracker.record_and_hint("lib_add_pin")
@@ -100,6 +171,7 @@ def register_library_tools(mcp):
     @mcp.tool()
     async def lib_add_pins(
         pins: list[dict[str, Any]],
+        default_owner_part_id: int = 1,
     ) -> dict[str, Any]:
         """Add MANY pins to the current symbol in ONE call.
 
@@ -109,7 +181,12 @@ def register_library_tools(mcp):
 
         Args:
             pins: List of pin dicts, each with:
-                - designator (str, required)
+                - designator (str, required) — a SINGLE package-pad
+                  identifier (e.g., "1", "M11", "A4"). Comma-separated
+                  alias strings like "A4,A6,B1" are REJECTED: each
+                  schematic pin must map 1:1 to exactly one footprint
+                  pad. For BGAs with many GND/VCC balls, emit one entry
+                  per ball with the same ``name`` and unique designators.
                 - name       (str, required)
                 - x, y       (int, mils) — pin endpoint
                 - length     (int, mils, default 200)
@@ -118,28 +195,40 @@ def register_library_tools(mcp):
                   input/output/bidirectional/passive/open_collector/
                   open_emitter/power/hiz/io
                 - hidden     (bool, default False)
+                - owner_part_id (int, optional) — multi-part owner.
+                  1..N picks the part; 0 marks the pin as shared across
+                  all parts (canonical for VCC/GND on multi-part chips).
+                  If omitted on a pin, falls back to ``default_owner_part_id``.
+            default_owner_part_id: Fallback ``owner_part_id`` for pins that
+                don't set their own. Default 1 (regular single-part behavior).
+                Set to 0 when the whole batch is shared power/ground pins.
 
-        Example — a 4-pin dual op-amp stage:
+        Example — quad op-amp stage A plus shared power:
             lib_add_pins(pins=[
-                {"designator": "1", "name": "OUT1",  "x": 0,   "y": 0,
-                 "rotation": 180, "electrical_type": "output"},
-                {"designator": "2", "name": "IN1-",  "x": 0,   "y": 100,
-                 "rotation": 180, "electrical_type": "input"},
-                {"designator": "3", "name": "IN1+",  "x": 0,   "y": 200,
-                 "rotation": 180, "electrical_type": "input"},
-                {"designator": "4", "name": "GND",   "x": 0,   "y": 300,
-                 "rotation": 180, "electrical_type": "power"},
+                {"designator": "1",  "name": "OUT_A", "x": 0, "y": 0,
+                 "electrical_type": "output", "owner_part_id": 1},
+                {"designator": "2",  "name": "IN_A-", "x": 0, "y": 100,
+                 "electrical_type": "input",  "owner_part_id": 1},
+                {"designator": "3",  "name": "IN_A+", "x": 0, "y": 200,
+                 "electrical_type": "input",  "owner_part_id": 1},
+                {"designator": "4",  "name": "VCC",   "x": 0, "y": -100,
+                 "electrical_type": "power",  "owner_part_id": 0},
+                {"designator": "11", "name": "GND",   "x": 0, "y": -200,
+                 "electrical_type": "power",  "owner_part_id": 0},
             ])
 
         Returns:
             Dict with added, failed, total counts.
         """
+        if default_owner_part_id < 0:
+            raise InvalidParameterError("default_owner_part_id must be >= 0 (0 = shared)")
         op_strs: list[str] = []
-        for p in pins:
-            desig = str(p.get("designator", "")).strip()
+        for idx, p in enumerate(pins):
             name = str(p.get("name", "")).strip()
-            if not desig:
-                continue
+            desig = _validate_pin_designator(
+                p.get("designator", ""),
+                context=f"pins[{idx}] (name={name!r})",
+            )
             fields = [
                 f"designator={desig}",
                 f"name={name}",
@@ -150,6 +239,13 @@ def register_library_tools(mcp):
                 f"electrical_type={p.get('electrical_type', 'passive')}",
                 f"hidden={'true' if p.get('hidden') else 'false'}",
             ]
+            if "owner_part_id" in p:
+                opid = int(p["owner_part_id"])
+                if opid < 0:
+                    raise InvalidParameterError(
+                        f"owner_part_id must be >= 0 (got {opid} for pin {desig!r})"
+                    )
+                fields.append(f"owner_part_id={opid}")
             op_strs.append(";".join(fields))
 
         if not op_strs:
@@ -158,7 +254,10 @@ def register_library_tools(mcp):
         bridge = get_bridge()
         return await bridge.send_command_async(
             "library.add_pins",
-            {"pins": "~~".join(op_strs)},
+            {
+                "pins": "~~".join(op_strs),
+                "default_owner_part_id": default_owner_part_id,
+            },
         )
 
     @mcp.tool()
@@ -167,8 +266,9 @@ def register_library_tools(mcp):
         y1: int,
         x2: int,
         y2: int,
-        fill_color: int = -1,
+        fill_color: int = 11599871,
         border_color: int = 0,
+        owner_part_id: int = 1,
     ) -> dict[str, Any]:
         """Add a rectangle to the current symbol body.
 
@@ -177,12 +277,23 @@ def register_library_tools(mcp):
             y1: First corner Y in mils
             x2: Opposite corner X in mils
             y2: Opposite corner Y in mils
-            fill_color: Fill color index (-1 = no fill)
-            border_color: Border color index
+            fill_color: Body fill color as a Delphi TColor integer
+                (BGR-packed). Default ``11599871`` ($00B0FFFF) is the
+                standard Altium cream-yellow IC body fill — the same
+                color you see on stock library symbols. Pass ``-1`` for
+                no fill (transparent body).
+            border_color: Border line color as a Delphi TColor integer.
+                Default ``0`` (black).
+            owner_part_id: Multi-part owner. 1..N picks which part the
+                rectangle belongs to (matches ``part_count`` on
+                ``lib_create_symbol``). ``0`` marks it as shared across
+                all parts. Default 1.
 
         Returns:
             Dictionary confirming rectangle addition
         """
+        if owner_part_id < 0:
+            raise InvalidParameterError("owner_part_id must be >= 0 (0 = shared)")
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "library.add_symbol_rectangle",
@@ -193,6 +304,7 @@ def register_library_tools(mcp):
                 "y2": y2,
                 "fill_color": fill_color,
                 "border_color": border_color,
+                "owner_part_id": owner_part_id,
             },
         )
         return result
@@ -204,6 +316,7 @@ def register_library_tools(mcp):
         x2: int,
         y2: int,
         width: int = 1,
+        owner_part_id: int = 1,
     ) -> dict[str, Any]:
         """Add a line to the current symbol.
 
@@ -213,14 +326,21 @@ def register_library_tools(mcp):
             x2: End X in mils
             y2: End Y in mils
             width: Line width
+            owner_part_id: Multi-part owner. 1..N picks the part; 0 marks
+                the line as shared across all parts. Default 1.
 
         Returns:
             Dictionary confirming line addition
         """
+        if owner_part_id < 0:
+            raise InvalidParameterError("owner_part_id must be >= 0 (0 = shared)")
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "library.add_symbol_line",
-            {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "width": width},
+            {
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "width": width, "owner_part_id": owner_part_id,
+            },
         )
         return result
 
@@ -514,7 +634,9 @@ def register_library_tools(mcp):
             library_path: Path to the library (currently ignored — see note)
 
         Returns:
-            Dictionary with full component details including pins and parameters
+            Dictionary with full component details. Includes ``part_count``
+            (number of functional parts; 1 for ordinary symbols, >1 for
+            multi-part symbols like quad op-amps).
         """
         bridge = get_bridge()
         result = await bridge.send_command_async(
@@ -656,6 +778,7 @@ def register_library_tools(mcp):
         start_angle: float = 0,
         end_angle: float = 360,
         width: int = 1,
+        owner_part_id: int = 1,
     ) -> dict[str, Any]:
         """Add an arc to the current library symbol.
 
@@ -666,10 +789,14 @@ def register_library_tools(mcp):
             start_angle: Start angle in degrees (0 = right, 90 = up)
             end_angle: End angle in degrees
             width: Line width (0=zero, 1=small, 2=medium, 3=large)
+            owner_part_id: Multi-part owner. 1..N picks the part; 0 marks
+                the arc as shared across all parts. Default 1.
 
         Returns:
             Dictionary confirming arc addition
         """
+        if owner_part_id < 0:
+            raise InvalidParameterError("owner_part_id must be >= 0 (0 = shared)")
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "library.add_symbol_arc",
@@ -680,6 +807,7 @@ def register_library_tools(mcp):
                 "start_angle": start_angle,
                 "end_angle": end_angle,
                 "width": width,
+                "owner_part_id": owner_part_id,
             },
         )
         return result
@@ -687,6 +815,7 @@ def register_library_tools(mcp):
     @mcp.tool()
     async def lib_add_symbol_polygon(
         vertices: str,
+        owner_part_id: int = 1,
     ) -> dict[str, Any]:
         """Add a polygon (filled shape) to the current library symbol.
 
@@ -695,16 +824,536 @@ def register_library_tools(mcp):
                 Example: "0,0,100,0,100,100,0,100" creates a square with
                 vertices at (0,0), (100,0), (100,100), (0,100).
                 Minimum 3 vertices (6 values) required.
+            owner_part_id: Multi-part owner. 1..N picks the part; 0 marks
+                the polygon as shared across all parts. Default 1.
 
         Returns:
             Dictionary confirming polygon addition with vertex count
         """
+        if owner_part_id < 0:
+            raise InvalidParameterError("owner_part_id must be >= 0 (0 = shared)")
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "library.add_symbol_polygon",
-            {"vertices": vertices},
+            {"vertices": vertices, "owner_part_id": owner_part_id},
         )
         return result
+
+    @mcp.tool()
+    async def lib_create_multipart_symbol(
+        name: str,
+        parts: list[dict[str, Any]],
+        designator_prefix: str = "U",
+        description: str = "",
+        shared_pins: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """Create a multi-part schematic symbol end-to-end in one call.
+
+        Use this for components like quad op-amps, dual gates, or complex
+        chips like the AD9361 that are split into functional blocks
+        (e.g., RF / baseband / power). Each entry in ``parts`` becomes one
+        functional unit that auto-suffixes when placed (U1A, U1B, ...).
+
+        This is a Python orchestrator that delegates to the lower-level
+        building blocks: ``lib_create_symbol`` (with ``part_count``), then
+        per-part body + pin placements, then a final batch for shared pins.
+        It does NOT auto-layout — you provide all coordinates in mils. For
+        rectangle-body chips with auto-layout, prefer ``lib_create_ic_symbol``.
+
+        ====== 1:1 pin-to-pad mapping (HARD RULE) ======
+
+        Every pin entry in ``parts[i]["pins"]`` and ``shared_pins`` must
+        have a SINGLE package-pad designator. Multi-pin alias strings
+        like ``"A4,A6,B1"`` (sometimes used to fold ground/power balls
+        onto one symbol pin) are REJECTED — the validator will raise
+        ``InvalidParameterError``. For BGAs / large packages where many
+        balls share a net (28× VSSA on a 144-ball BGA, 50× GND on a
+        484-ball Zynq, etc.), emit one pin per ball with the same name
+        and unique BGA-coordinate designators. This keeps schematic and
+        footprint pin counts in sync — the 1:1 invariant is the only
+        thing that lets ECO, BOM, and pick-and-place stay coherent.
+
+        Args:
+            name: Component name (e.g., "LM324", "AD9361").
+            parts: One dict per functional part. Each dict supports:
+                - ``body`` (optional): the part's outline. Accepts either:
+                  * a single dict — short form for a rectangle:
+                    ``{"x1": int, "y1": int, "x2": int, "y2": int}``
+                  * a list of shape dicts, each with a ``kind`` field
+                    (``"rect"`` / ``"line"`` / ``"arc"`` / ``"polygon"``)
+                    plus that shape's parameters (same as the matching
+                    ``lib_add_symbol_*`` tool). Use the list form to draw
+                    op-amp triangles, gate symbols, or any multi-shape body.
+                  All coordinates are in mils. Skip if you don't want a body.
+                - ``pins`` (required): list of pin dicts in the same shape
+                  ``lib_add_pins`` accepts (designator/name/x/y/length/
+                  rotation/electrical_type/hidden). ``owner_part_id`` is
+                  set automatically to this part's index — do NOT include it.
+            designator_prefix: Default designator prefix. "U" for ICs.
+            description: Component description (visible in the library panel).
+            shared_pins: Pins that appear on every part (e.g., VCC, GND on
+                a quad op-amp). Same dict shape as ``parts[i]["pins"]``.
+                Each is created with ``owner_part_id=0`` (Altium's "shared
+                across all parts" sentinel). Pass ``None`` or ``[]`` for
+                components with no shared pins.
+
+        Returns:
+            Dict with::
+                {"success": True,
+                 "name": ..., "part_count": N,
+                 "parts": [{"index": 1, "body": "ok"|"skipped",
+                            "pins_added": k, "pins_failed": 0}, ...],
+                 "shared_pins_added": int}
+            Or, on early failure, the error dict from the underlying call.
+
+        Example — LM324 quad op-amp:
+            lib_create_multipart_symbol(
+                name="LM324",
+                description="Quad low-power op-amp",
+                parts=[
+                    {
+                        "body": {"x1": -200, "y1": -200, "x2": 200, "y2": 200},
+                        "pins": [
+                            {"designator": "1", "name": "OUT_A",
+                             "x": 200, "y": 0, "electrical_type": "output"},
+                            {"designator": "2", "name": "IN_A-",
+                             "x": -200, "y": 100, "electrical_type": "input"},
+                            {"designator": "3", "name": "IN_A+",
+                             "x": -200, "y": -100, "electrical_type": "input"},
+                        ],
+                    },
+                    # ... parts B/C/D in the same shape
+                ],
+                shared_pins=[
+                    {"designator": "4",  "name": "V+",
+                     "x": 0, "y": 300, "electrical_type": "power"},
+                    {"designator": "11", "name": "V-",
+                     "x": 0, "y": -300, "electrical_type": "power"},
+                ],
+            )
+        """
+        if not parts:
+            raise InvalidParameterError("parts must contain at least one entry")
+        for i, part in enumerate(parts, start=1):
+            if not isinstance(part, dict):
+                raise InvalidParameterError(f"parts[{i-1}] must be a dict")
+            if "pins" not in part or not part["pins"]:
+                raise InvalidParameterError(
+                    f"parts[{i-1}] is missing required 'pins' list"
+                )
+
+        part_count = len(parts)
+        bridge = get_bridge()
+
+        create_result = await bridge.send_command_async(
+            "library.create_symbol",
+            {
+                "name": name,
+                "designator_prefix": designator_prefix,
+                "description": description,
+                "part_count": part_count,
+            },
+        )
+        if not isinstance(create_result, dict) or not create_result.get("success"):
+            return create_result
+
+        per_part_results: list[dict[str, Any]] = []
+
+        for index, part in enumerate(parts, start=1):
+            body_spec = part.get("body")
+            if body_spec is None:
+                shapes: list[dict[str, Any]] = []
+            elif isinstance(body_spec, dict):
+                shapes = [body_spec]
+            elif isinstance(body_spec, list):
+                shapes = list(body_spec)
+            else:
+                raise InvalidParameterError(
+                    f"parts[{index-1}]['body'] must be dict or list, got {type(body_spec).__name__}"
+                )
+
+            body_ok = 0
+            body_failed = 0
+            for shape in shapes:
+                kind = shape.get("kind", "rect")
+                if kind == "rect":
+                    payload = {
+                        "x1": int(shape.get("x1", 0)),
+                        "y1": int(shape.get("y1", 0)),
+                        "x2": int(shape.get("x2", 0)),
+                        "y2": int(shape.get("y2", 0)),
+                        # Default to standard Altium cream-yellow body fill
+                        # (TColor $00B0FFFF). Pass fill_color=-1 for no fill.
+                        "fill_color": int(shape.get("fill_color", 11599871)),
+                        "border_color": int(shape.get("border_color", 0)),
+                        "owner_part_id": index,
+                    }
+                    cmd = "library.add_symbol_rectangle"
+                elif kind == "line":
+                    payload = {
+                        "x1": int(shape.get("x1", 0)),
+                        "y1": int(shape.get("y1", 0)),
+                        "x2": int(shape.get("x2", 0)),
+                        "y2": int(shape.get("y2", 0)),
+                        "width": int(shape.get("width", 1)),
+                        "owner_part_id": index,
+                    }
+                    cmd = "library.add_symbol_line"
+                elif kind == "arc":
+                    payload = {
+                        "x_center": int(shape.get("x_center", 0)),
+                        "y_center": int(shape.get("y_center", 0)),
+                        "radius": int(shape.get("radius", 100)),
+                        "start_angle": shape.get("start_angle", 0),
+                        "end_angle": shape.get("end_angle", 360),
+                        "width": int(shape.get("width", 1)),
+                        "owner_part_id": index,
+                    }
+                    cmd = "library.add_symbol_arc"
+                elif kind == "polygon":
+                    vertices = shape.get("vertices", "")
+                    if not vertices:
+                        raise InvalidParameterError(
+                            f"parts[{index-1}] polygon shape needs 'vertices' (comma-separated x,y pairs)"
+                        )
+                    payload = {
+                        "vertices": vertices,
+                        "owner_part_id": index,
+                    }
+                    cmd = "library.add_symbol_polygon"
+                else:
+                    raise InvalidParameterError(
+                        f"parts[{index-1}] unknown shape kind {kind!r} "
+                        f"(expected rect / line / arc / polygon)"
+                    )
+                shape_result = await bridge.send_command_async(cmd, payload)
+                if isinstance(shape_result, dict) and shape_result.get("success"):
+                    body_ok += 1
+                else:
+                    body_failed += 1
+
+            if not shapes:
+                body_status = "skipped"
+            elif body_failed == 0:
+                body_status = f"{body_ok} ok"
+            else:
+                body_status = f"{body_ok} ok, {body_failed} failed"
+
+            op_strs: list[str] = []
+            for pin_idx, p in enumerate(part["pins"]):
+                pname = str(p.get('name', '')).strip()
+                desig = _validate_pin_designator(
+                    p.get("designator", ""),
+                    context=f"parts[{index-1}].pins[{pin_idx}] (name={pname!r})",
+                )
+                fields = [
+                    f"designator={desig}",
+                    f"name={pname}",
+                    f"x={int(p.get('x', 0))}",
+                    f"y={int(p.get('y', 0))}",
+                    f"length={int(p.get('length', 200))}",
+                    f"rotation={int(p.get('rotation', 0))}",
+                    f"electrical_type={p.get('electrical_type', 'passive')}",
+                    f"hidden={'true' if p.get('hidden') else 'false'}",
+                ]
+                op_strs.append(";".join(fields))
+
+            pins_added = 0
+            pins_failed = 0
+            if op_strs:
+                pins_result = await bridge.send_command_async(
+                    "library.add_pins",
+                    {
+                        "pins": "~~".join(op_strs),
+                        "default_owner_part_id": index,
+                    },
+                )
+                if isinstance(pins_result, dict):
+                    pins_added = int(pins_result.get("added", 0))
+                    pins_failed = int(pins_result.get("failed", 0))
+
+            per_part_results.append({
+                "index": index,
+                "body": body_status,
+                "pins_added": pins_added,
+                "pins_failed": pins_failed,
+            })
+
+        shared_added = 0
+        if shared_pins:
+            op_strs = []
+            for sp_idx, p in enumerate(shared_pins):
+                pname = str(p.get('name', '')).strip()
+                desig = _validate_pin_designator(
+                    p.get("designator", ""),
+                    context=f"shared_pins[{sp_idx}] (name={pname!r})",
+                )
+                fields = [
+                    f"designator={desig}",
+                    f"name={pname}",
+                    f"x={int(p.get('x', 0))}",
+                    f"y={int(p.get('y', 0))}",
+                    f"length={int(p.get('length', 200))}",
+                    f"rotation={int(p.get('rotation', 0))}",
+                    f"electrical_type={p.get('electrical_type', 'passive')}",
+                    f"hidden={'true' if p.get('hidden') else 'false'}",
+                ]
+                op_strs.append(";".join(fields))
+            if op_strs:
+                shared_result = await bridge.send_command_async(
+                    "library.add_pins",
+                    {
+                        "pins": "~~".join(op_strs),
+                        "default_owner_part_id": 0,
+                    },
+                )
+                if isinstance(shared_result, dict):
+                    shared_added = int(shared_result.get("added", 0))
+
+        return {
+            "success": True,
+            "name": name,
+            "part_count": part_count,
+            "parts": per_part_results,
+            "shared_pins_added": shared_added,
+        }
+
+    @mcp.tool()
+    async def lib_create_ic_symbol(
+        name: str,
+        parts: list[dict[str, Any]],
+        designator_prefix: str = "U",
+        description: str = "",
+        pin_length: int = 200,
+        pin_spacing: int = 100,
+        char_width: int = 55,
+        body_padding: int = 200,
+    ) -> dict[str, Any]:
+        """Create a multi-part rectangular IC symbol with full auto-layout.
+
+        This is the right tool for the canonical chip-symbol pattern: one
+        filled rectangle body per functional part, pins on left and right
+        sides only, pin NAMES rendered INSIDE the body, pin DESIGNATORS
+        (the package pin numbers) rendered OUTSIDE on the wire stub.
+        Body width and height are computed automatically from the pin
+        counts and the longest pin name on each side. Scales cleanly from
+        a 14-pin LM324 to a 1000-pin FPGA — just give it more parts and
+        more pins.
+
+        Why this exists separately from ``lib_create_multipart_symbol``:
+        the lower-level orchestrator takes explicit pin coordinates and
+        body shapes, which is the right API for non-rectangular bodies
+        (op-amp triangles, gate symbols, etc.). For rectangle-body chips
+        — which is 95% of real components — coordinate math is pure
+        boilerplate, and the LLM should just describe the pin lists.
+
+        Pin geometry follows Altium's actual convention (per the official
+        Pin Properties documentation): ``Pin.Location`` is the
+        non-electrical end (the body-attach point), and the pin extends
+        outward from there by ``pin_length`` in the direction set by
+        rotation. So body-attach sits exactly on the body edge, the
+        electrical tip is one pin-length past the edge, and the pin name
+        renders INSIDE the body anchored at the body-attach end. This
+        matches the layout of stock Altium symbols and reference designs.
+
+        Args:
+            name: Component LibReference (e.g., "AD9361", "XC7Z020CLG484").
+            parts: List of part dicts, one per functional unit (placed as
+                A/B/C/...). Each part dict has:
+
+                - ``left_pins`` (list, optional): pins on the left side,
+                  top-to-bottom. Each entry is either a dict
+                  ``{"designator": str, "name": str, "electrical_type":
+                  str, "hidden": bool}`` OR ``None`` to insert a visual
+                  group separator (one blank row of vertical space, no
+                  pin created — use this between functional groups).
+                  ``electrical_type`` defaults to ``"passive"``;
+                  ``hidden`` defaults to False. ``designator`` MUST be
+                  a single package-pad identifier (e.g. ``"1"``,
+                  ``"M11"``, ``"A4"``) — comma-separated alias strings
+                  like ``"A4,A6,B1"`` are REJECTED by the validator.
+                  See "1:1 pin-to-pad mapping" below.
+                - ``right_pins`` (list, optional): same format, on right.
+
+                A part must have at least one pin in either side.
+
+            ====== 1:1 pin-to-pad mapping (HARD RULE) ======
+
+            Every entry in ``left_pins`` / ``right_pins`` becomes one
+            schematic pin, and that pin maps directly to one footprint
+            pad during PCB binding. Multiple package balls served by the
+            same net (e.g., 28× VSSA grounds on a 144-ball BGA, 50× GND
+            balls on a 484-ball Zynq, 100+ GND balls on a big FPGA) MUST
+            be split into individual pin entries — one per ball, each
+            with the actual ball-coordinate as its designator and the
+            same ``name`` (e.g., ``"GND"``). This makes the symbol
+            taller but it is the only correct option: consolidating
+            balls onto a single pin via comma-separated designators
+            silently breaks annotation, ECO, BOM, and pick-and-place.
+
+            For very large packages (484+ pins) where one giant power
+            part would be unwieldy, split power into several parts
+            instead — e.g., one part per voltage domain (VCCINT,
+            VCCAUX, VCCO_BANK_*, GND), each holding its own balls.
+            The 1:1 invariant still holds within each part.
+            designator_prefix: Default designator prefix on placement
+                (e.g., "U" for ICs, "Q" for transistors). Default "U".
+            description: Component description shown in the library panel.
+            pin_length: Length of the pin line from body-attach to
+                electrical tip, in mils. Default 200 (Altium convention).
+            pin_spacing: Vertical spacing between adjacent pin rows in
+                mils. Default 100 (Altium grid).
+            char_width: Approximate mils per character used to size the
+                body width so pin names fit inside without overlapping.
+                Default 55 fits Altium's default schematic font; raise
+                if you see clipping, lower if the body looks too wide.
+            body_padding: Mils added on each side beyond the longest
+                names (creates breathing room inside the body). Default 200.
+
+        Returns:
+            Same shape as ``lib_create_multipart_symbol``: dict with
+            ``success``, ``name``, ``part_count``, ``parts`` (per-part
+            body and pin counts), and ``shared_pins_added`` (always 0
+            here — power pins live on a dedicated power part).
+
+        Example — minimal 2-part chip with a group separator:
+
+            lib_create_ic_symbol(
+                name="DEMO_IC",
+                parts=[
+                    {  # Part A
+                        "left_pins": [
+                            {"designator": "1", "name": "IN1",  "electrical_type": "input"},
+                            {"designator": "2", "name": "IN2",  "electrical_type": "input"},
+                            None,  # whitespace separator
+                            {"designator": "3", "name": "EN",   "electrical_type": "input"},
+                        ],
+                        "right_pins": [
+                            {"designator": "4", "name": "OUT",  "electrical_type": "output"},
+                        ],
+                    },
+                    {  # Part B (e.g., power)
+                        "left_pins": [
+                            {"designator": "5", "name": "VCC",  "electrical_type": "power"},
+                        ],
+                        "right_pins": [
+                            {"designator": "6", "name": "GND",  "electrical_type": "power"},
+                        ],
+                    },
+                ],
+            )
+        """
+        if not parts:
+            raise InvalidParameterError("parts must contain at least one entry")
+        if pin_length <= 0:
+            raise InvalidParameterError("pin_length must be > 0")
+        if pin_spacing <= 0:
+            raise InvalidParameterError("pin_spacing must be > 0")
+        if char_width <= 0:
+            raise InvalidParameterError("char_width must be > 0")
+
+        built_parts: list[dict[str, Any]] = []
+
+        for part_idx, part in enumerate(parts, start=1):
+            if not isinstance(part, dict):
+                raise InvalidParameterError(
+                    f"parts[{part_idx-1}] must be a dict"
+                )
+            left_rows = list(part.get("left_pins") or [])
+            right_rows = list(part.get("right_pins") or [])
+            if not left_rows and not right_rows:
+                raise InvalidParameterError(
+                    f"parts[{part_idx-1}] must have at least one pin in left_pins or right_pins"
+                )
+
+            # Validate pin entries and compute longest name on each side.
+            # Designators are validated through _validate_pin_designator,
+            # which enforces the 1-pin-per-pad invariant (rejects multi-pin
+            # alias strings like 'A4,A6,B1' that break footprint binding).
+            def _max_chars(rows: list[Any], side: str) -> int:
+                longest = 0
+                for j, r in enumerate(rows):
+                    if r is None:
+                        continue
+                    if not isinstance(r, dict):
+                        raise InvalidParameterError(
+                            f"parts[{part_idx-1}].{side}[{j}] must be a dict or None (got {type(r).__name__})"
+                        )
+                    nm = str(r.get("name", "")).strip()
+                    if not nm:
+                        raise InvalidParameterError(
+                            f"parts[{part_idx-1}].{side}[{j}] missing required 'name'"
+                        )
+                    _validate_pin_designator(
+                        r.get("designator", ""),
+                        context=f"parts[{part_idx-1}].{side}[{j}] (name={nm!r})",
+                    )
+                    if len(nm) > longest:
+                        longest = len(nm)
+                return longest
+
+            max_left_chars = _max_chars(left_rows, "left_pins")
+            max_right_chars = _max_chars(right_rows, "right_pins")
+
+            # Auto-size body. Width fits the widest left + right names with
+            # padding. Round to 100-mil grid; enforce a sensible minimum.
+            raw_w = (max_left_chars + max_right_chars) * char_width + body_padding * 2
+            body_w = max(((raw_w + 99) // 100) * 100, 400)
+            half_w = body_w // 2
+
+            n_rows = max(len(left_rows), len(right_rows), 1)
+            raw_h = n_rows * pin_spacing + body_padding
+            body_h = max(((raw_h + 99) // 100) * 100, 300)
+            half_h = body_h // 2
+
+            # Top-down y assignment: row 0 at the top, decreasing by spacing.
+            top_y = ((n_rows - 1) * pin_spacing) // 2
+
+            pins: list[dict[str, Any]] = []
+            for i, row in enumerate(left_rows):
+                if row is None:
+                    continue
+                pins.append({
+                    "designator": str(row["designator"]),
+                    "name": str(row["name"]),
+                    "x": -half_w,           # body-attach AT body's left edge
+                    "y": top_y - i * pin_spacing,
+                    "length": pin_length,
+                    "rotation": 180,        # extends LEFT outward
+                    "electrical_type": row.get("electrical_type", "passive"),
+                    "hidden": bool(row.get("hidden", False)),
+                })
+            for i, row in enumerate(right_rows):
+                if row is None:
+                    continue
+                pins.append({
+                    "designator": str(row["designator"]),
+                    "name": str(row["name"]),
+                    "x": half_w,            # body-attach AT body's right edge
+                    "y": top_y - i * pin_spacing,
+                    "length": pin_length,
+                    "rotation": 0,          # extends RIGHT outward
+                    "electrical_type": row.get("electrical_type", "passive"),
+                    "hidden": bool(row.get("hidden", False)),
+                })
+
+            built_parts.append({
+                "body": {
+                    "x1": -half_w, "y1": -half_h,
+                    "x2":  half_w, "y2":  half_h,
+                },
+                "pins": pins,
+            })
+
+        # Delegate to the lower-level orchestrator (it handles
+        # create_symbol + per-part body + per-part pin batches).
+        return await lib_create_multipart_symbol(
+            name=name,
+            parts=built_parts,
+            designator_prefix=designator_prefix,
+            description=description,
+            shared_pins=None,
+        )
 
     @mcp.tool()
     async def lib_set_component_description(
@@ -732,9 +1381,12 @@ def register_library_tools(mcp):
         """Get all pins of the current library component.
 
         Returns:
-            Dictionary with "count", "component" name, and "pins" array.
-            Each pin has: designator, name, electrical_type, x, y,
-            orientation, hidden
+            Dictionary with "count", "component" name, "part_count" (total
+            functional parts in the component — 1 for ordinary symbols),
+            and "pins" array. Each pin has: designator, name,
+            electrical_type, x, y, orientation, hidden, owner_part_id
+            (1..N picks which part the pin belongs to; 0 means shared
+            across all parts).
         """
         bridge = get_bridge()
         result = await bridge.send_command_async(
