@@ -11,9 +11,44 @@ this folder up).
 |---|---|
 | `deploy.ps1` | Copy modified DelphiScript files to the runtime location so Altium can reload them. Optional Python re-install. Has a `-Watch` mode for redeploy-on-save. |
 | `deploy.cmd` | One-line wrapper that invokes `deploy.ps1` with execution policy bypassed for that call (no permanent system change). Forwards all args. |
+| `setup-mcp.ps1` | Safely add or remove the eda-agent MCP entry in **both** `~/.claude.json` (Claude Code CLI) and `%APPDATA%\Claude\claude_desktop_config.json` (Claude Desktop). Detects running Desktop processes and asks you to close it (or kills it on confirm) before editing — Desktop overwrites the file when running. Backups + no-BOM writes. |
+| `setup-mcp.cmd` | Wrapper for `setup-mcp.ps1` so it runs without changing PowerShell execution policy. |
 | `smoke.py` | Direct stdio MCP client. Spawns `eda-agent.exe` and calls tools without an LLM in the loop — the inner dev cycle. |
 | `multipart-plan.md` | Design doc for multi-part symbol support (the first feature we're adding). |
 | `README.md` | This file. |
+
+## setup-mcp examples
+
+```powershell
+# Default: add the altium MCP to both Claude Code CLI and Claude Desktop.
+# If Desktop is running you'll be asked: kill it / wait for you / cancel.
+.\dev\setup-mcp.cmd
+
+# Dry run -- show what would happen, no writes.
+.\dev\setup-mcp.cmd -DryRun
+
+# Remove the altium MCP from both configs.
+.\dev\setup-mcp.cmd -Remove
+
+# Only touch one of them.
+.\dev\setup-mcp.cmd -CliOnly
+.\dev\setup-mcp.cmd -DesktopOnly
+
+# Skip prompts (useful in scripts). Combines well with -Force, which
+# kills Desktop processes without asking.
+.\dev\setup-mcp.cmd -Yes -Force
+
+# Register a different MCP server (not altium):
+.\dev\setup-mcp.cmd -Name myserver -Command "C:\path\to\my-mcp-server.exe"
+
+# With args / env:
+.\dev\setup-mcp.cmd -Name foo -Command "C:\foo.exe" `
+                    -Args "--debug","--port","9000" `
+                    -Env @{ FOO_LOG="trace" }
+```
+
+Each write makes a timestamped backup next to the original
+(`*.bak-setup-mcp-YYYYMMDD-HHMMSS`).
 
 ## One-time setup
 
