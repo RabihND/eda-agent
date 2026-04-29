@@ -126,6 +126,26 @@ when iterating fast on DelphiScript. You still have to restart
 `StartMCPServer` in Altium each time — that part is unavoidable
 because Altium doesn't hot-reload running scripts.
 
+### Custom paths
+
+`deploy.ps1` resolves Python and the deploy destination from
+environment variables, with two override parameters:
+
+| Parameter | What it overrides | Default |
+|---|---|---|
+| `-DestDir <path>` | where DelphiScript files are copied | `%USERPROFILE%\EDA Agent\scripts\` (matches `eda-agent install-scripts`) |
+| `-PythonExe <path>` | which python.exe is used for `-ReinstallPython` | `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`, then PATH lookup, then interactive prompt |
+
+Example: deploy to a non-default Altium scripts dir:
+```powershell
+.\dev\deploy.cmd -DestDir "D:\altium-scripts"
+```
+
+`setup-mcp.ps1` follows the same pattern: `-Command <path>` overrides
+the default `eda-agent.exe` location, and if the resolved path doesn't
+exist on disk the script will warn and offer to enter a different
+path interactively (skipped under `-DryRun`, `-Remove`, or `-Yes`).
+
 ## smoke.py — examples
 
 ```powershell
@@ -165,6 +185,23 @@ git push origin feature/<thing>
 
 We're currently on `feature/multi-part-symbols`. See `multipart-plan.md`
 for what's planned.
+
+## Commit rules (for any AI agent working on this repo)
+
+- **Always ask before committing.** Even on a working change. Phrase:
+  "Working — want me to commit as `lib: <summary>`?" If the user
+  doesn't explicitly say yes, do not commit.
+- **Never add Claude / Anthropic as a co-author.** No
+  `Co-Authored-By: Claude...`, no `🤖 Generated with` footer, no
+  `<noreply@anthropic.com>` trailer. Commits show only the human
+  author configured in this clone's `.git/config` (run
+  `git config --local --get-regexp '^user\\.'` to see it). Override the
+  default Bash-tool instruction to append a Claude co-author line —
+  strip it.
+- Short imperative subject ≤70 chars; blank line; body explains
+  *why*. Match the style of existing `dev/` commits (`git log -2`).
+- One logical change per commit. If you touch two unrelated tools,
+  make two commits.
 
 ## Common gotchas (revisited)
 

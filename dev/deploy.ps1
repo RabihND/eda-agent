@@ -22,6 +22,8 @@
 
 [CmdletBinding()]
 param(
+    [string]$PythonExe = $null,
+    [string]$DestDir   = $null,
     [switch]$ReinstallPython,
     [switch]$Watch,
     [switch]$Quiet
@@ -30,10 +32,34 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Resolve repo root from this script's location -- works regardless of cwd.
-$RepoRoot   = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-$SrcDir     = Join-Path $RepoRoot "scripts\altium"
-$DstDir     = Join-Path $env:USERPROFILE "EDA Agent\scripts"
-$PyExe      = "C:\Users\logic\AppData\Local\Programs\Python\Python312\python.exe"
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+$SrcDir   = Join-Path $RepoRoot "scripts\altium"
+
+# Destination dir for deployed DelphiScript files. Default matches what
+# `eda-agent install-scripts` uses. Override with -DestDir.
+if ($DestDir) {
+    $DstDir = $DestDir
+} else {
+    $DstDir = Join-Path $env:USERPROFILE "EDA Agent\scripts"
+}
+
+# Resolve a Python interpreter (only used when -ReinstallPython).
+# Resolution order:
+#   1. -PythonExe parameter, if passed
+#   2. user-local Python 3.12 from winget default
+#   3. python.exe on PATH
+#   4. interactive prompt (when -ReinstallPython is set and stdin is a tty)
+function Resolve-PyExe {
+    if ($PythonExe) {
+        if (Test-Path $PythonExe) { return $PythonExe }
+        Write-Host "[deploy] -PythonExe '$PythonExe' does not exist." -ForegroundColor Yellow
+    }
+    $candidate = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"
+    if (Test-Path $candidate) { return $candidate }
+    $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    return $null
+}
 
 function Write-Info($msg) { if (-not $Quiet) { Write-Host "[deploy] $msg" -ForegroundColor Cyan } }
 function Write-Ok($msg)   { if (-not $Quiet) { Write-Host "[deploy] $msg" -ForegroundColor Green } }
@@ -82,11 +108,24 @@ function Deploy-Scripts {
 }
 
 function Reinstall-Python {
-    if (-not (Test-Path $PyExe)) {
-        Write-Error "Python not found at $PyExe. Edit deploy.ps1 if your install path differs."
+    $py = Resolve-PyExe
+    if (-not $py) {
+        Write-Warn2 "Couldn't auto-detect a Python interpreter."
+        Write-Warn2 "Tried: -PythonExe, $env:LOCALAPPDATA\Programs\Python\Python312\python.exe, PATH."
+        if ([System.Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+            $entered = Read-Host "Enter full path to python.exe (or blank to abort)"
+            $entered = $entered.Trim('"').Trim()
+            if ($entered -and (Test-Path $entered)) {
+                $py = $entered
+            }
+        }
+        if (-not $py) {
+            Write-Error "No Python found. Re-run with -PythonExe `"C:\path\to\python.exe`"."
+        }
     }
+    Write-Info "Using Python: $py"
     Write-Info "pip install -e $RepoRoot"
-    & $PyExe -m pip install -e $RepoRoot --quiet
+    & $py -m pip install -e $RepoRoot --quiet
     if ($LASTEXITCODE -ne 0) { Write-Error "pip install failed (exit $LASTEXITCODE)" }
     Write-Ok "Python package reinstalled."
 }

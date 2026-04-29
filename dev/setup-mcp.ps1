@@ -33,7 +33,7 @@
 [CmdletBinding()]
 param(
     [string]$Name = "altium",
-    [string]$Command = "C:\Users\logic\AppData\Local\Programs\Python\Python312\Scripts\eda-agent.exe",
+    [string]$Command = (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\Scripts\eda-agent.exe"),
     [string[]]$Args = @(),
     [hashtable]$Env = @{},
     [switch]$Remove,
@@ -340,6 +340,35 @@ Say-Info "Server name : $Name"
 Say-Info "Command     : $Command"
 if ($Args.Count -gt 0) { Say-Info "Args        : $($Args -join ' ')" }
 Say-Info "Mode        : $(if ($Remove) {'remove'} else {'add'})$(if ($DryRun) {' (dry run)'})"
+
+# Sanity-check the Command path. Skip on -Remove (we don't need the binary
+# to exist to delete its registration) and on -DryRun (informational mode).
+if (-not $Remove -and -not $DryRun -and -not (Test-Path $Command)) {
+    Say-Warn "Command path does not exist on disk: $Command"
+    Say-Warn "MCP clients will fail to spawn the server until that file is in place."
+    if (-not $Yes) {
+        Write-Host "  [E] Enter a different path now"
+        Write-Host "  [P] Proceed anyway (file will be there later)"
+        Write-Host "  [C] Cancel"
+        $r = (Read-Host "  Choice [E/P/C]").Trim().ToUpperInvariant()
+        switch ($r) {
+            "E" {
+                $entered = Read-Host "Enter full path to the MCP server executable"
+                $entered = $entered.Trim('"').Trim()
+                if (-not $entered) { Say-Err "Empty path. Aborting."; exit 1 }
+                $Command = $entered
+                Say-Info "Command     : $Command"
+                if (-not (Test-Path $Command)) {
+                    Say-Warn "That path also doesn't exist; continuing anyway."
+                }
+            }
+            "P" { Say-Info "Proceeding with non-existent path as requested." }
+            default { Say-Warn "Cancelled."; exit 1 }
+        }
+    } else {
+        Say-Info "(-Yes given; proceeding without prompt.)"
+    }
+}
 
 $cliOk     = $true
 $desktopOk = $true
