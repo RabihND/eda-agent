@@ -6,15 +6,20 @@
 
 Function Lib_CreateSymbol(Params : String; RequestId : String) : String;
 Var
-    Name, DesignatorPrefix, Description : String;
+    Name, DesignatorPrefix, Description, PartCountStr : String;
+    PartCount : Integer;
     SchLib : ISch_Lib;
     Component : ISch_Component;
 Begin
     Name := ExtractJsonValue(Params, 'name');
     DesignatorPrefix := ExtractJsonValue(Params, 'designator_prefix');
     Description := ExtractJsonValue(Params, 'description');
+    PartCountStr := ExtractJsonValue(Params, 'part_count');
 
     If DesignatorPrefix = '' Then DesignatorPrefix := 'U';
+    If PartCountStr = '' Then PartCount := 1
+    Else PartCount := StrToIntDef(PartCountStr, 1);
+    If PartCount < 1 Then PartCount := 1;
 
     // Get the current schematic library
     If SchServer = Nil Then
@@ -37,6 +42,11 @@ Begin
         Component.LibReference := Name;
         Component.Designator.Text := DesignatorPrefix + '?';
         Component.ComponentDescription := Description;
+        // Multi-part support: PartCount must be set BEFORE adding pins so
+        // OwnerPartId assignments on subsequent primitives are accepted.
+        Component.PartCount := PartCount;
+        Component.CurrentPartID := 1;
+        Component.DisplayMode := 0;
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
         SchLib.AddSchComponent(Component);
@@ -44,7 +54,7 @@ Begin
         SchLib.CurrentSchComponent := Component;
 
         SaveDocByPath(SchLib.DocumentName);
-        Result := BuildSuccessResponse(RequestId, '{"success":true,"name":"' + EscapeJsonString(Name) + '"}');
+        Result := BuildSuccessResponse(RequestId, '{"success":true,"name":"' + EscapeJsonString(Name) + '","part_count":' + IntToStr(PartCount) + '}');
     End
     Else
         Result := BuildErrorResponse(RequestId, 'CREATE_FAILED', 'Failed to create symbol');
@@ -52,12 +62,13 @@ End;
 
 Function Lib_AddPin(Params : String; RequestId : String) : String;
 Var
-    Designator, Name, ElecType : String;
-    X, Y, Length, Rotation : Integer;
+    Designator, Name, ElecType, OwnerPartIdStr : String;
+    X, Y, Length, Rotation, OwnerPartId : Integer;
     Hidden : Boolean;
     SchLib : ISch_Lib;
     Component : ISch_Component;
     Pin : ISch_Pin;
+    Loc : TLocation;
 Begin
     Designator := ExtractJsonValue(Params, 'designator');
     Name := ExtractJsonValue(Params, 'name');
@@ -67,6 +78,9 @@ Begin
     Rotation := StrToIntDef(ExtractJsonValue(Params, 'rotation'), 0);
     ElecType := ExtractJsonValue(Params, 'electrical_type');
     Hidden := ExtractJsonValue(Params, 'hidden') = 'true';
+    OwnerPartIdStr := ExtractJsonValue(Params, 'owner_part_id');
+    If OwnerPartIdStr = '' Then OwnerPartId := 1
+    Else OwnerPartId := StrToIntDef(OwnerPartIdStr, 1);
 
     SchLib := SchServer.GetCurrentSchDocument;
     If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
@@ -87,11 +101,17 @@ Begin
     Begin
         Pin.Designator := Designator;
         Pin.Name := Name;
-        Pin.Location.X := MilsToCoord(X);
-        Pin.Location.Y := MilsToCoord(Y);
+        { Location is a by-value record — read, mutate, write back. }
+        Loc := Pin.Location;
+        Loc.X := MilsToCoord(X);
+        Loc.Y := MilsToCoord(Y);
+        Pin.Location := Loc;
         Pin.PinLength := MilsToCoord(Length);
         Pin.Orientation := Rotation Div 90;
         Pin.IsHidden := Hidden;
+        // Multi-part: 0 = shared across all parts, 1..N = belongs to part K.
+        Pin.OwnerPartId := OwnerPartId;
+        Pin.OwnerPartDisplayMode := 0;
 
         // Set electrical type. The bidirectional constant is spelled
         // eElectricIO in Altium's DelphiScript (eElectricBiDir is undeclared).
@@ -111,7 +131,7 @@ Begin
         SchServer.ProcessControl.PostProcess(SchLib, '');
 
         SaveDocByPath(SchLib.DocumentName);
-        Result := BuildSuccessResponse(RequestId, '{"success":true,"designator":"' + EscapeJsonString(Designator) + '"}');
+        Result := BuildSuccessResponse(RequestId, '{"success":true,"designator":"' + EscapeJsonString(Designator) + '","owner_part_id":' + IntToStr(OwnerPartId) + '}');
     End
     Else
         Result := BuildErrorResponse(RequestId, 'CREATE_FAILED', 'Failed to create pin');
@@ -119,15 +139,28 @@ End;
 
 Function Lib_AddSymbolRectangle(Params : String; RequestId : String) : String;
 Var
-    X1, Y1, X2, Y2 : Integer;
+    X1, Y1, X2, Y2, OwnerPartId, FillColor, BorderColor : Integer;
+    OwnerPartIdStr, FillColorStr, BorderColorStr : String;
     SchLib : ISch_Lib;
     Component : ISch_Component;
     Rect : ISch_Rectangle;
+    Loc, Cnr : TLocation;
 Begin
     X1 := StrToIntDef(ExtractJsonValue(Params, 'x1'), 0);
     Y1 := StrToIntDef(ExtractJsonValue(Params, 'y1'), 0);
     X2 := StrToIntDef(ExtractJsonValue(Params, 'x2'), 0);
     Y2 := StrToIntDef(ExtractJsonValue(Params, 'y2'), 0);
+    OwnerPartIdStr := ExtractJsonValue(Params, 'owner_part_id');
+    If OwnerPartIdStr = '' Then OwnerPartId := 1
+    Else OwnerPartId := StrToIntDef(OwnerPartIdStr, 1);
+    // fill_color: -1 means no fill; >=0 is a packed BGR Delphi TColor.
+    // Standard Altium symbol body fill is $00B0FFFF (cream-yellow) = 11599871.
+    FillColorStr := ExtractJsonValue(Params, 'fill_color');
+    If FillColorStr = '' Then FillColor := 11599871
+    Else FillColor := StrToIntDef(FillColorStr, 11599871);
+    BorderColorStr := ExtractJsonValue(Params, 'border_color');
+    If BorderColorStr = '' Then BorderColor := 0
+    Else BorderColor := StrToIntDef(BorderColorStr, 0);
 
     SchLib := SchServer.GetCurrentSchDocument;
     If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
@@ -146,11 +179,31 @@ Begin
     Rect := SchServer.SchObjectFactory(eRectangle, eCreate_Default);
     If Rect <> Nil Then
     Begin
-        Rect.Location.X := MilsToCoord(X1);
-        Rect.Location.Y := MilsToCoord(Y1);
-        Rect.Corner.X := MilsToCoord(X2);
-        Rect.Corner.Y := MilsToCoord(Y2);
-        Rect.IsSolid := False;
+        { Location and Corner are by-value records — read, mutate, write back. }
+        Loc := Rect.Location;
+        Loc.X := MilsToCoord(X1);
+        Loc.Y := MilsToCoord(Y1);
+        Rect.Location := Loc;
+        Cnr := Rect.Corner;
+        Cnr.X := MilsToCoord(X2);
+        Cnr.Y := MilsToCoord(Y2);
+        Rect.Corner := Cnr;
+        // Apply fill: <0 = transparent (legacy callers); else solid AreaColor.
+        If FillColor < 0 Then
+            Rect.IsSolid := False
+        Else
+        Begin
+            Rect.IsSolid := True;
+            Rect.AreaColor := FillColor;
+        End;
+        // Border line color — `Color` property on ISch_GraphicalObject
+        // (NOT `LineColor`, which exists only on ISch_Line). Per Altium's
+        // Schematic API docs the Color property "denotes the color region
+        // of a closed object which is usually the border outline".
+        Rect.Color := BorderColor;
+        // Multi-part: 0 = shared across all parts, 1..N = belongs to part K.
+        Rect.OwnerPartId := OwnerPartId;
+        Rect.OwnerPartDisplayMode := 0;
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
         Component.AddSchObject(Rect);
@@ -166,10 +219,12 @@ End;
 
 Function Lib_AddSymbolLine(Params : String; RequestId : String) : String;
 Var
-    X1, Y1, X2, Y2, Width : Integer;
+    X1, Y1, X2, Y2, Width, OwnerPartId : Integer;
+    OwnerPartIdStr : String;
     SchLib : ISch_Lib;
     Component : ISch_Component;
     Line : ISch_Line;
+    Loc, Cnr : TLocation;
 Begin
     X1 := StrToIntDef(ExtractJsonValue(Params, 'x1'), 0);
     Y1 := StrToIntDef(ExtractJsonValue(Params, 'y1'), 0);
@@ -178,6 +233,9 @@ Begin
     Width := StrToIntDef(ExtractJsonValue(Params, 'width'), 1);
     If Width < 0 Then Width := 0;
     If Width > 3 Then Width := 3;
+    OwnerPartIdStr := ExtractJsonValue(Params, 'owner_part_id');
+    If OwnerPartIdStr = '' Then OwnerPartId := 1
+    Else OwnerPartId := StrToIntDef(OwnerPartIdStr, 1);
 
     SchLib := SchServer.GetCurrentSchDocument;
     If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
@@ -196,11 +254,19 @@ Begin
     Line := SchServer.SchObjectFactory(eLine, eCreate_Default);
     If Line <> Nil Then
     Begin
-        Line.Location.X := MilsToCoord(X1);
-        Line.Location.Y := MilsToCoord(Y1);
-        Line.Corner.X := MilsToCoord(X2);
-        Line.Corner.Y := MilsToCoord(Y2);
+        { Location and Corner are by-value records — read, mutate, write back. }
+        Loc := Line.Location;
+        Loc.X := MilsToCoord(X1);
+        Loc.Y := MilsToCoord(Y1);
+        Line.Location := Loc;
+        Cnr := Line.Corner;
+        Cnr.X := MilsToCoord(X2);
+        Cnr.Y := MilsToCoord(Y2);
+        Line.Corner := Cnr;
         Line.LineWidth := Width;
+        // Multi-part: 0 = shared across all parts, 1..N = belongs to part K.
+        Line.OwnerPartId := OwnerPartId;
+        Line.OwnerPartDisplayMode := 0;
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
         Component.AddSchObject(Line);
@@ -1057,7 +1123,8 @@ End;
 
 Function Lib_AddSymbolArc(Params : String; RequestId : String) : String;
 Var
-    XCenter, YCenter, Radius, StartAngle, EndAngle, Width : Integer;
+    XCenter, YCenter, Radius, StartAngle, EndAngle, Width, OwnerPartId : Integer;
+    OwnerPartIdStr : String;
     SchLib : ISch_Lib;
     Component : ISch_Component;
     Arc : ISch_Arc;
@@ -1070,6 +1137,9 @@ Begin
     Width := StrToIntDef(ExtractJsonValue(Params, 'width'), 1);
     If Width < 0 Then Width := 0;
     If Width > 3 Then Width := 3;
+    OwnerPartIdStr := ExtractJsonValue(Params, 'owner_part_id');
+    If OwnerPartIdStr = '' Then OwnerPartId := 1
+    Else OwnerPartId := StrToIntDef(OwnerPartIdStr, 1);
 
     SchLib := SchServer.GetCurrentSchDocument;
     If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
@@ -1093,6 +1163,9 @@ Begin
         Arc.StartAngle := StartAngle;
         Arc.EndAngle := EndAngle;
         Arc.LineWidth := Width;
+        // Multi-part: 0 = shared across all parts, 1..N = belongs to part K.
+        Arc.OwnerPartId := OwnerPartId;
+        Arc.OwnerPartDisplayMode := 0;
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
         Component.AddSchObject(Arc);
@@ -1113,12 +1186,12 @@ End;
 
 Function Lib_AddSymbolPolygon(Params : String; RequestId : String) : String;
 Var
-    VerticesStr, Token : String;
+    VerticesStr, Token, OwnerPartIdStr : String;
     SchLib : ISch_Lib;
     Component : ISch_Component;
     Polygon : ISch_Polygon;
     Remaining : String;
-    CommaPos, VertexCount, X, Y, I : Integer;
+    CommaPos, VertexCount, X, Y, I, OwnerPartId : Integer;
     XValues, YValues : Array[0..99] Of Integer;
 Begin
     VerticesStr := ExtractJsonValue(Params, 'vertices');
@@ -1128,6 +1201,10 @@ Begin
         Result := BuildErrorResponse(RequestId, 'MISSING_PARAMS', 'vertices parameter is required');
         Exit;
     End;
+
+    OwnerPartIdStr := ExtractJsonValue(Params, 'owner_part_id');
+    If OwnerPartIdStr = '' Then OwnerPartId := 1
+    Else OwnerPartId := StrToIntDef(OwnerPartIdStr, 1);
 
     SchLib := SchServer.GetCurrentSchDocument;
     If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
@@ -1189,6 +1266,9 @@ Begin
         Polygon.VerticesCount := VertexCount;
         Polygon.IsSolid := True;
         Polygon.LineWidth := eSmall;
+        // Multi-part: 0 = shared across all parts, 1..N = belongs to part K.
+        Polygon.OwnerPartId := OwnerPartId;
+        Polygon.OwnerPartDisplayMode := 0;
 
         For I := 1 To VertexCount Do
             Polygon.Vertex[I] := Point(MilsToCoord(XValues[I-1]), MilsToCoord(YValues[I-1]));
@@ -1313,7 +1393,8 @@ Begin
                 '","x":' + IntToStr(CoordToMils(Pin.Location.X)) +
                 ',"y":' + IntToStr(CoordToMils(Pin.Location.Y)) +
                 ',"orientation":' + IntToStr(Pin.Orientation) +
-                ',"hidden":' + BoolToJsonStr(Pin.IsHidden) + '}';
+                ',"hidden":' + BoolToJsonStr(Pin.IsHidden) +
+                ',"owner_part_id":' + IntToStr(Pin.OwnerPartId) + '}';
             Inc(PinCount);
 
             Pin := PinIterator.NextSchObject;
@@ -1325,7 +1406,8 @@ Begin
     Result := BuildSuccessResponse(RequestId,
         '{"count":' + IntToStr(PinCount) +
         ',"component":"' + EscapeJsonString(Component.LibReference) +
-        '","pins":[' + JsonItems + ']}');
+        '","part_count":' + IntToStr(Component.PartCount) +
+        ',"pins":[' + JsonItems + ']}');
 End;
 
 {..............................................................................}
@@ -1404,10 +1486,10 @@ End;
 
 Function Lib_AddPins(Params : String; RequestId : String) : String;
 Var
-    PinsStr, Op, Remaining : String;
+    PinsStr, Op, Remaining, DefaultOwnerStr : String;
     OpCount, Added, Failed : Integer;
-    Designator, Name, ElecType, HiddenStr : String;
-    X, Y, Length, Rotation : Integer;
+    Designator, Name, ElecType, HiddenStr, OwnerStr : String;
+    X, Y, Length, Rotation, OwnerPartId, DefaultOwnerPartId : Integer;
     Hidden : Boolean;
     SchLib : ISch_Lib;
     Component : ISch_Component;
@@ -1420,6 +1502,9 @@ Begin
         Result := BuildErrorResponse(RequestId, 'MISSING_PARAM', 'pins is required');
         Exit;
     End;
+    DefaultOwnerStr := ExtractJsonValue(Params, 'default_owner_part_id');
+    If DefaultOwnerStr = '' Then DefaultOwnerPartId := 1
+    Else DefaultOwnerPartId := StrToIntDef(DefaultOwnerStr, 1);
 
     SchLib := SchServer.GetCurrentSchDocument;
     If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
@@ -1456,6 +1541,9 @@ Begin
             ElecType := GetBatchField(Op, 'electrical_type');
             HiddenStr := GetBatchField(Op, 'hidden');
             Hidden := (HiddenStr = 'true') Or (HiddenStr = '1');
+            OwnerStr := GetBatchField(Op, 'owner_part_id');
+            If OwnerStr = '' Then OwnerPartId := DefaultOwnerPartId
+            Else OwnerPartId := StrToIntDef(OwnerStr, DefaultOwnerPartId);
 
             Pin := SchServer.SchObjectFactory(ePin, eCreate_Default);
             If Pin = Nil Then
@@ -1474,6 +1562,9 @@ Begin
             Pin.PinLength := MilsToCoord(Length);
             Pin.Orientation := Rotation Div 90;
             Pin.IsHidden := Hidden;
+            // Multi-part: 0 = shared across all parts, 1..N = belongs to part K.
+            Pin.OwnerPartId := OwnerPartId;
+            Pin.OwnerPartDisplayMode := 0;
 
             If ElecType = 'input' Then Pin.Electrical := eElectricInput
             Else If ElecType = 'output' Then Pin.Electrical := eElectricOutput
