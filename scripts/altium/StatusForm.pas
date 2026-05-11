@@ -154,9 +154,22 @@ Begin
         Try lbl_LastErr.Caption := 'last error: ' + Command; Except End;
 End;
 
+{ Status dot color = at-a-glance health indicator:                            }
+{   green  = idle, ready for the next request                                  }
+{   amber  = currently processing a command (in-flight)                        }
+{   red    = last command errored                                              }
 Procedure UpdateStatusHeader(StatusStr : String);
+Var
+    DotColor : Integer;
 Begin
     Try lbl_Status.Caption := StatusStr; Except End;
+    { Heuristic dot color from the status string. Avoids needing to plumb a
+      separate "state" enum through every call-site. }
+    DotColor := $0064C864;  { default green - idle/ok }
+    If Pos('running', StatusStr) > 0 Then DotColor := $004FA0FF;  { amber-blue - in-flight }
+    If Pos('error',   StatusStr) > 0 Then DotColor := $005C5CFF;  { red - error }
+    If Pos('starting', StatusStr) > 0 Then DotColor := $00808080;  { grey - starting up }
+    Try pnl_StatusDot.Color := DotColor; Except End;
 End;
 
 Procedure UpdateStatsLine(UptimeSec, Requests : Integer; AltiumMs : Cardinal;
@@ -233,72 +246,69 @@ End;
 { to the resting colour on leave. Tab handlers preserve the active/inactive }
 { distinction so leaving a tab returns to the correct resting colour.        }
 
+{ Hover handlers — brighten the panel while the mouse is over it, revert    }
+{ to the resting colour on leave. Tab handlers preserve the active/inactive }
+{ distinction so leaving a tab returns to the correct resting colour.        }
+
 Procedure btn_DetachEnter(Sender : TObject);
-Begin Try btn_Detach.Color := $00505050; Except End; End;
+Begin Try btn_Detach.Color := $00553838; Except End; End;
 Procedure btn_DetachLeave(Sender : TObject);
-Begin Try btn_Detach.Color := $003A3A3A; Except End; End;
+Begin Try btn_Detach.Color := $003B2C2C; Except End; End;
 
 Procedure btn_ClearLogEnter(Sender : TObject);
-Begin Try btn_ClearLog.Color := $00505050; Except End; End;
+Begin Try btn_ClearLog.Color := $00383838; Except End; End;
 Procedure btn_ClearLogLeave(Sender : TObject);
-Begin Try btn_ClearLog.Color := $003A3A3A; Except End; End;
+Begin Try btn_ClearLog.Color := $00282828; Except End; End;
 
 Procedure btn_ResetPerfEnter(Sender : TObject);
-Begin Try btn_ResetPerf.Color := $00505050; Except End; End;
+Begin Try btn_ResetPerf.Color := $00383838; Except End; End;
 Procedure btn_ResetPerfLeave(Sender : TObject);
-Begin Try btn_ResetPerf.Color := $003A3A3A; Except End; End;
+Begin Try btn_ResetPerf.Color := $00282828; Except End; End;
 
 Procedure chk_HidePingsEnter(Sender : TObject);
-Begin Try chk_HidePings.Color := $002E2E2E; Except End; End;
-Procedure chk_HidePingsLeave(Sender : TObject);
 Begin Try chk_HidePings.Color := $001E1E1E; Except End; End;
+Procedure chk_HidePingsLeave(Sender : TObject);
+Begin Try chk_HidePings.Color := $00141414; Except End; End;
 
 Procedure chk_OnlySlowEnter(Sender : TObject);
-Begin Try chk_OnlySlow.Color := $002E2E2E; Except End; End;
-Procedure chk_OnlySlowLeave(Sender : TObject);
 Begin Try chk_OnlySlow.Color := $001E1E1E; Except End; End;
+Procedure chk_OnlySlowLeave(Sender : TObject);
+Begin Try chk_OnlySlow.Color := $00141414; Except End; End;
 
 Procedure tab_LogEnter(Sender : TObject);
 Begin
     Try
-        If mmo_Log.Visible Then tab_Log.Color := $00252525
-        Else tab_Log.Color := $00353535;
+        If Not mmo_Log.Visible Then tab_Log.Color := $001E1E1E;
     Except End;
 End;
 Procedure tab_LogLeave(Sender : TObject);
 Begin
-    Try
-        If mmo_Log.Visible Then tab_Log.Color := $001A1A1A
-        Else tab_Log.Color := $00252526;
-    Except End;
+    Try tab_Log.Color := $00141414; Except End;
 End;
 
 Procedure tab_PerfEnter(Sender : TObject);
 Begin
     Try
-        If mmo_Perf.Visible Then tab_Perf.Color := $00252525
-        Else tab_Perf.Color := $00353535;
+        If Not mmo_Perf.Visible Then tab_Perf.Color := $001E1E1E;
     Except End;
 End;
 Procedure tab_PerfLeave(Sender : TObject);
 Begin
-    Try
-        If mmo_Perf.Visible Then tab_Perf.Color := $001A1A1A
-        Else tab_Perf.Color := $00252526;
-    Except End;
+    Try tab_Perf.Color := $00141414; Except End;
 End;
 
-{ Manual tab handlers: clicking Log or Perf swaps which TMemo is visible and }
-{ updates the tab colours to show active state.                              }
+{ Manual tab handlers: clicking Log or Perf swaps which TMemo is visible      }
+{ and updates the underline panels to indicate the active tab (Material-style }
+{ underline). Tab text color also swaps to highlight the active tab.          }
 Procedure tab_LogClick(Sender : TObject);
 Begin
     Try
         mmo_Log.Visible := True;
         mmo_Perf.Visible := False;
-        tab_Log.Color := $001A1A1A;
         tab_Log.Font.Color := $00F0D090;
-        tab_Perf.Color := $00252526;
-        tab_Perf.Font.Color := $00909090;
+        tab_Perf.Font.Color := $00808080;
+        pnl_TabUnderlineLog.Color := $00F0D090;
+        pnl_TabUnderlinePerf.Color := $00141414;
     Except End;
 End;
 
@@ -307,9 +317,9 @@ Begin
     Try
         mmo_Log.Visible := False;
         mmo_Perf.Visible := True;
-        tab_Perf.Color := $001A1A1A;
         tab_Perf.Font.Color := $00F0D090;
-        tab_Log.Color := $00252526;
-        tab_Log.Font.Color := $00909090;
+        tab_Log.Font.Color := $00808080;
+        pnl_TabUnderlinePerf.Color := $00F0D090;
+        pnl_TabUnderlineLog.Color := $00141414;
     Except End;
 End;
