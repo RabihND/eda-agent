@@ -1609,6 +1609,7 @@ Var
     Param : ISch_Parameter;
     Workspace : IWorkspace;
     Doc : IDocument;
+    ServerDoc : IServerDocument;
     LibPath, Data, CompName, ParamList, WithParamsStr : String;
     CompNum, I : Integer;
     First, WithParams : Boolean;
@@ -1648,6 +1649,20 @@ Begin
         Result := BuildErrorResponse(RequestId, 'NO_LIBRARY', 'No library path and no active document');
         Exit;
     End;
+
+    { CreateLibCompInfoReader reads the on-disk file directly. If the
+      library is open in-editor with unsaved changes, the reader returns
+      a stale snapshot — newly created components don't show up until
+      the user calls save_all. Force a flush on the matching IServerDocument
+      so subsequent ReadAllComponentInfo sees the latest write. }
+    Try
+        ServerDoc := Client.GetDocumentByPath(LibPath);
+        If ServerDoc <> Nil Then
+        Begin
+            If ServerDoc.Modified Then
+                Try ServerDoc.DoFileSave(''); Except End;
+        End;
+    Except End;
 
     // Use CreateLibCompInfoReader to enumerate components. ICompInfoReader is
     // a fast metadata reader, it returns CompName, AliasName, PartCount and
@@ -2110,6 +2125,12 @@ Begin
     End;
 
     Component := SchLib.GetState_SchComponentByLibRef(ComponentName);
+    { Prefer the live Component.PartCount over the CompInfo reader's
+      value — the reader has been observed to return PartCount+1 on
+      Altium 26.5 (off-by-one, probably counting a shared/OwnerPartId=0
+      bucket). The live property matches what Lib_CreateSymbol wrote. }
+    If Component <> Nil Then
+        Try PartCount := Component.PartCount; Except End;
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'COMPONENT_NOT_FOUND',
@@ -2403,7 +2424,7 @@ Var
     Doc : IDocument;
     ServerDoc : IServerDocument;
     F : TextFile;
-    Line, OldName, NewName : String;
+    Line, OldName, NewName, Errors : String;
     PipePos : Integer;
     Renamed, Failed, LineNum : Integer;
 Begin
@@ -2458,6 +2479,7 @@ Begin
     Renamed := 0;
     Failed := 0;
     LineNum := 0;
+    Errors := '';
 
     // Begin modification block
     SchServer.ProcessControl.PreProcess(SchLib, '');
@@ -2477,6 +2499,8 @@ Begin
                 If PipePos = 0 Then
                 Begin
                     Inc(Failed);
+                    If Errors <> '' Then Errors := Errors + ';';
+                    Errors := Errors + 'line ' + IntToStr(LineNum) + ': malformed (no | separator)';
                     Continue;
                 End;
                 OldName := Copy(Line, 1, PipePos - 1);
@@ -2486,14 +2510,35 @@ Begin
                 If Component = Nil Then
                 Begin
                     Inc(Failed);
+                    If Errors <> '' Then Errors := Errors + ';';
+                    Errors := Errors + OldName + '->' + NewName + ': component not found';
                     Continue;
                 End;
 
-                // Must remove and re-add to update the library's internal index
-                SchLib.RemoveSchComponent(Component);
-                Component.LibReference := NewName;
-                SchLib.AddSchComponent(Component);
-                Inc(Renamed);
+                { Collision check — Altium silently keeps the old name if
+                  the target already exists, so flag it up. }
+                If SchLib.GetState_SchComponentByLibRef(NewName) <> Nil Then
+                Begin
+                    Inc(Failed);
+                    If Errors <> '' Then Errors := Errors + ';';
+                    Errors := Errors + OldName + '->' + NewName + ': target name already exists';
+                    Continue;
+                End;
+
+                { Per-row Try/Except so a single bad write doesn't abort
+                  the whole batch. The remove-and-readd pattern is what
+                  actually updates the library's internal name index;
+                  just writing Component.LibReference won't propagate. }
+                Try
+                    SchLib.RemoveSchComponent(Component);
+                    Component.LibReference := NewName;
+                    SchLib.AddSchComponent(Component);
+                    Inc(Renamed);
+                Except
+                    Inc(Failed);
+                    If Errors <> '' Then Errors := Errors + ';';
+                    Errors := Errors + OldName + '->' + NewName + ': write raised';
+                End;
             End;
         Finally
             CloseFile(F);
@@ -2509,7 +2554,101 @@ Begin
     Result := BuildSuccessResponse(RequestId,
         '{"renamed":' + IntToStr(Renamed) +
         ',"failed":' + IntToStr(Failed) +
-        ',"total_lines":' + IntToStr(LineNum) + '}');
+        ',"total_lines":' + IntToStr(LineNum) +
+        ',"errors":"' + EscapeJsonString(Errors) + '"}');
+End;
+
+{..............................................................................}
+{ Lib_DeleteComponent — remove a single component from the focused SchLib by    }
+{ its LibReference. Pairs with batch_rename for library cleanup workflows.      }
+{..............................................................................}
+Function Lib_DeleteComponent(Params : String; RequestId : String) : String;
+Var
+    Name : String;
+    SchLib : ISch_Lib;
+    Component : ISch_Component;
+Begin
+    Name := ExtractJsonValue(Params, 'name');
+    If Name = '' Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'MISSING_PARAM', 'name is required');
+        Exit;
+    End;
+
+    SchLib := SchServer.GetCurrentSchDocument;
+    If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_SCHLIB', 'No schematic library is active');
+        Exit;
+    End;
+
+    Component := SchLib.GetState_SchComponentByLibRef(Name);
+    If Component = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'COMPONENT_NOT_FOUND', 'Component not found: ' + Name);
+        Exit;
+    End;
+
+    SchServer.ProcessControl.PreProcess(SchLib, '');
+    Try
+        SchLib.RemoveSchComponent(Component);
+    Except
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
+        Result := BuildErrorResponse(RequestId, 'DELETE_FAILED', 'RemoveSchComponent raised on: ' + Name);
+        Exit;
+    End;
+    SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
+    MarkLibDirty(SchLib);
+    Try SchLib.GraphicallyInvalidate; Except End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"deleted":true,"name":"' + EscapeJsonString(Name) + '"}');
+End;
+
+{..............................................................................}
+{ Lib_SetActivePart — change which part of a multi-part SchLib component is     }
+{ currently displayed in the editor. Pairs with query_objects' per-part fix     }
+{ so callers can drive the editor view to a specific part for inspection.      }
+{..............................................................................}
+Function Lib_SetActivePart(Params : String; RequestId : String) : String;
+Var
+    PartIdStr : String;
+    PartId, MaxParts : Integer;
+    SchLib : ISch_Lib;
+    Component : ISch_Component;
+Begin
+    PartIdStr := ExtractJsonValue(Params, 'part_id');
+    PartId := StrToIntDef(PartIdStr, 1);
+
+    SchLib := SchServer.GetCurrentSchDocument;
+    If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_SCHLIB', 'No schematic library is active');
+        Exit;
+    End;
+
+    Component := SchLib.CurrentSchComponent;
+    If Component = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected in the SchLib');
+        Exit;
+    End;
+
+    MaxParts := Component.PartCount;
+    If (PartId < 1) Or (PartId > MaxParts) Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'PART_OUT_OF_RANGE',
+            'part_id ' + IntToStr(PartId) + ' is outside [1, ' + IntToStr(MaxParts) + ']');
+        Exit;
+    End;
+
+    Try Component.CurrentPartID := PartId; Except End;
+    Try SchLib.GraphicallyInvalidate; Except End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"part_id":' + IntToStr(PartId) +
+        ',"part_count":' + IntToStr(MaxParts) +
+        ',"component":"' + EscapeJsonString(Component.LibReference) + '"}');
 End;
 
 {..............................................................................}
@@ -3685,6 +3824,8 @@ Begin
         'copy_component':     Result := Lib_CopyComponent(Params, RequestId);
         'audit_styles':       Result := Lib_AuditStyles(Params, RequestId);
         'set_label_format':   Result := Lib_SetLabelFormat(Params, RequestId);
+        'delete_component':   Result := Lib_DeleteComponent(Params, RequestId);
+        'set_active_part':    Result := Lib_SetActivePart(Params, RequestId);
     Else
         Result := BuildErrorResponse(RequestId, 'UNKNOWN_ACTION', 'Unknown library action: ' + Action);
     End;

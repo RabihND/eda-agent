@@ -1450,6 +1450,53 @@ def register_library_tools(mcp):
         return result
 
     @mcp.tool()
+    async def lib_delete_component(
+        name: str,
+    ) -> dict[str, Any]:
+        """Delete a component from the focused schematic library.
+
+        Pairs with lib_batch_rename for library cleanup workflows.
+
+        Args:
+            name: LibReference (component name) to remove. Must be the
+                exact name as it appears in the SchLib panel.
+
+        Returns:
+            Dict with ``deleted`` (bool) and ``name``.
+        """
+        bridge = get_bridge()
+        result = await bridge.send_command_async(
+            "library.delete_component",
+            {"name": name},
+        )
+        return result
+
+    @mcp.tool()
+    async def lib_set_active_part(
+        part_id: int,
+    ) -> dict[str, Any]:
+        """Switch which part of a multi-part component the SchLib editor displays.
+
+        Useful when working through the parts of a multi-part symbol
+        (FPGA banks, op-amp gates) for inspection or per-part edits.
+        ``query_objects`` walks all parts regardless of which one is
+        active — this only drives the editor view.
+
+        Args:
+            part_id: Part index in [1, part_count]. 1-based.
+
+        Returns:
+            Dict with the new ``part_id`` and the component's
+            ``part_count``.
+        """
+        bridge = get_bridge()
+        result = await bridge.send_command_async(
+            "library.set_active_part",
+            {"part_id": part_id},
+        )
+        return result
+
+    @mcp.tool()
     async def lib_diff_libraries(
         library_a: str,
         library_b: str,

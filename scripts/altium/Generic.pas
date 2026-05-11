@@ -31,7 +31,14 @@ Begin
     Else If TypeStr = 'eSheetEntry'    Then Result := eSheetEntry
     Else If TypeStr = 'eNoERC'         Then Result := eNoERC
     Else If TypeStr = 'eJunction'      Then Result := eJunction
-    Else If TypeStr = 'eImage'         Then Result := eImage;
+    Else If TypeStr = 'eImage'         Then Result := eImage
+    { Free text inside a SchLib symbol: Altium's primitive token is just
+      eLabel — there is no separate eTextString in the schematic API.
+      Accept the historical name as an alias so callers familiar with
+      the PCB-side `eTextString` aren't surprised. }
+    Else If TypeStr = 'eTextString'    Then Result := eLabel
+    Else If TypeStr = 'eText'          Then Result := eLabel
+    Else If TypeStr = 'eNote'          Then Result := eNote;
 End;
 
 {..............................................................................}
@@ -191,6 +198,11 @@ Begin
         Else If PropName = 'AreaColor'   Then Result := IntToStr(Obj.AreaColor)
         Else If PropName = 'TextColor'   Then Result := IntToStr(Obj.TextColor)
         Else If PropName = 'Justification' Then Result := IntToStr(Obj.Justification)
+        // Multi-part library primitive — 0 = shared across all parts,
+        // 1..N = belongs to that specific part. Critical for
+        // query_objects in multi-part SchLibs.
+        Else If PropName = 'OwnerPartId' Then Result := IntToStr(Obj.OwnerPartId)
+        Else If PropName = 'OwnerPartDisplayMode' Then Result := IntToStr(Obj.OwnerPartDisplayMode)
 
         // Coord properties (returned in mils)
         Else If PropName = 'Width'       Then Result := IntToStr(CoordToMils(Obj.Width))
@@ -394,7 +406,25 @@ End;
 { Apply pipe-separated "PropName=Value" assignments to an object             }
 {..............................................................................}
 
+{ ApplySetProperties / ApplySetPropertiesEx — parse a "k=v|k=v" string
+  and write each property onto the object. SetSchProperty already has a
+  blanket Try/Except, but the EX variant adds a second guard at the
+  call-site so even if the inner one is somehow bypassed (e.g. a debugger
+  break short-circuits the catch) we still advance the loop. The Ex
+  variant returns a "Skipped" string of the form
+  "Justification=2|FontID=99" listing every prop that the setter raised
+  on — Gen_CreateObject / Gen_ModifyObjects surface that to the caller
+  so a single bad value can be diagnosed instead of silently dropped. }
 Procedure ApplySetProperties(Obj : ISch_GraphicalObject; SetStr : String);
+Var
+    Skipped : String;
+Begin
+    Skipped := '';
+    ApplySetPropertiesEx(Obj, SetStr, Skipped);
+End;
+
+Procedure ApplySetPropertiesEx(Obj : ISch_GraphicalObject; SetStr : String;
+                                Var Skipped : String);
 Var
     Remaining, Assignment, PropName, PropValue : String;
     PipePos, EqPos : Integer;
@@ -419,7 +449,16 @@ Begin
         PropName := Copy(Assignment, 1, EqPos - 1);
         PropValue := Copy(Assignment, EqPos + 1, Length(Assignment));
 
-        SetSchProperty(Obj, PropName, PropValue);
+        Try
+            SetSchProperty(Obj, PropName, PropValue);
+        Except
+            { Even with SetSchProperty's inner guard, certain runtime errors
+              (native AVs in ADVPCB.DLL, debugger-trapped exceptions) can
+              escape. Track them here so the dispatcher returns a useful
+              diagnostic rather than dying silently. }
+            If Skipped <> '' Then Skipped := Skipped + '|';
+            Skipped := Skipped + PropName + '=' + PropValue;
+        End;
     End;
 End;
 
@@ -438,9 +477,83 @@ Var
     ObjJson : String;
     First : Boolean;
     MaxIter : Integer;
+    SchLib : ISch_Lib;
+    LibComp : ISch_Component;
 Begin
     Result := '';
     First := (TotalMatched = 0);
+
+    { SchLib documents need component-scoped iteration, otherwise the
+      built-in document iterator only walks primitives of the
+      currently-displayed part. For multi-part symbols (FPGA / SoC
+      banks, op-amp gates, etc.) this hides everything outside the
+      active part. Walk the focused component's primitives across all
+      parts — each primitive carries its OwnerPartId, which the caller
+      can request via "OwnerPartId" in the properties list to know
+      which part each match lives on. }
+    If (SchDoc <> Nil) And (SchDoc.ObjectId = eSchLib) Then
+    Begin
+        SchLib := SchDoc;
+        LibComp := SchLib.CurrentSchComponent;
+        If LibComp <> Nil Then
+        Begin
+            { Modify mode wraps in PreProcess/PostProcess for undo support. }
+            If Mode = 'modify' Then
+                SchServer.ProcessControl.PreProcess(SchLib, '');
+            If Mode = 'delete' Then
+                SchServer.ProcessControl.PreProcess(SchLib, '');
+
+            Iterator := LibComp.SchIterator_Create;
+            Iterator.AddFilter_ObjectSet(MkSet(ObjTypeInt));
+            Obj := Iterator.FirstSchObject;
+            While Obj <> Nil Do
+            Begin
+                If (Limit > 0) And (TotalMatched >= Limit) Then Break;
+                If MatchesFilter(Obj, FilterStr) Then
+                Begin
+                    If Mode = 'query' Then
+                    Begin
+                        ObjJson := BuildObjectJson(Obj, PropsStr);
+                        If Length(ObjJson) <= 2 Then
+                            ObjJson := '{"_doc":"' + EscapeJsonString(DocPath) + '"}'
+                        Else
+                            ObjJson := Copy(ObjJson, 1, 1) +
+                                       '"_doc":"' + EscapeJsonString(DocPath) +
+                                       '","_owner_part_id":' + IntToStr(Obj.OwnerPartId) +
+                                       ',' + Copy(ObjJson, 2, Length(ObjJson));
+                        If Not First Then Result := Result + ',';
+                        First := False;
+                        Result := Result + ObjJson;
+                    End
+                    Else If Mode = 'modify' Then
+                    Begin
+                        SchBeginModify(Obj);
+                        ApplySetProperties(Obj, SetStr);
+                        SchEndModify(Obj);
+                    End
+                    Else If Mode = 'delete' Then
+                    Begin
+                        Try LibComp.RemoveSchObject(Obj); Except End;
+                    End;
+                    Inc(TotalMatched);
+                End;
+                Obj := Iterator.NextSchObject;
+            End;
+            LibComp.SchIterator_Destroy(Iterator);
+
+            If Mode = 'modify' Then
+            Begin
+                SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
+                MarkLibDirty(SchLib);
+            End;
+            If Mode = 'delete' Then
+            Begin
+                SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
+                MarkLibDirty(SchLib);
+            End;
+        End;
+        Exit;
+    End;
 
     // Delete mode: one-at-a-time to avoid iterator invalidation.
     If Mode = 'delete' Then
@@ -852,12 +965,13 @@ End;
 
 Function Gen_CreateObject(Params : String; RequestId : String) : String;
 Var
-    ObjTypeStr, PropsStr, Container : String;
+    ObjTypeStr, PropsStr, Container, Skipped : String;
     ObjTypeInt : Integer;
     SchDoc : ISch_Document;
     SchLib : ISch_Lib;
     Component : ISch_Component;
     NewObj : ISch_GraphicalObject;
+    SkippedJson : String;
 Begin
     ObjTypeStr := ExtractJsonValue(Params, 'object_type');
     PropsStr := ExtractJsonValue(Params, 'properties');
@@ -879,8 +993,10 @@ Begin
         Exit;
     End;
 
-    // Set properties
-    ApplySetProperties(NewObj, PropsStr);
+    // Set properties — collect any per-property failures so the
+    // caller can diagnose bad enum values etc.
+    Skipped := '';
+    ApplySetPropertiesEx(NewObj, PropsStr, Skipped);
 
     // Register in container
     If Container = 'component' Then
@@ -901,9 +1017,17 @@ Begin
             Exit;
         End;
         SchServer.ProcessControl.PreProcess(SchLib, '');
+        // Pin the primitive to the right part. If the caller didn't
+        // specify OwnerPartId, SetOwnerPart falls back to the
+        // component's CurrentPartID. This is the missing step that
+        // caused labels created via create_object to never persist —
+        // they were attached but had no OwnerPartId mapping.
+        SetOwnerPart(NewObj, Component);
         Component.AddSchObject(NewObj);
         SchRegisterObject(Component, NewObj);
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
+        MarkLibDirty(SchLib);
+        Try SchLib.GraphicallyInvalidate; Except End;
     End
     Else
     Begin
@@ -922,7 +1046,12 @@ Begin
         SchDoc.GraphicallyInvalidate;
     End;
 
-    Result := BuildSuccessResponse(RequestId, '{"created":true,"object_type":"' + ObjTypeStr + '"}');
+    If Skipped <> '' Then
+        SkippedJson := ',"skipped_properties":"' + EscapeJsonString(Skipped) + '"'
+    Else
+        SkippedJson := '';
+    Result := BuildSuccessResponse(RequestId,
+        '{"created":true,"object_type":"' + ObjTypeStr + '"' + SkippedJson + '}');
 End;
 
 {..............................................................................}
@@ -1843,6 +1972,14 @@ Begin
     If SchDoc <> Nil Then
     Begin
         SchDoc.GraphicallyInvalidate;
+        { On SchLib docs the panel-side list of components doesn't
+          always rebuild from a GraphicallyInvalidate alone. We tried
+          a SCHM_LibraryComponentsListChanged broadcast but that
+          constant isn't declared on every Altium build. The fallback
+          that does work is to bounce the focus off the current doc
+          and back: closing+reopening the SchLib refreshes the panel.
+          For now we just invalidate and rely on the user to click
+          off/on the SchLib tab if the panel stays stale. }
         Result := BuildSuccessResponse(RequestId, '{"success":true,"context":"schematic"}');
     End
     Else If Board <> Nil Then
