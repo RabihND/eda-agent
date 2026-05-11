@@ -64,11 +64,73 @@ function Resolve-PyExe {
 function Write-Info($msg) { if (-not $Quiet) { Write-Host "[deploy] $msg" -ForegroundColor Cyan } }
 function Write-Ok($msg)   { if (-not $Quiet) { Write-Host "[deploy] $msg" -ForegroundColor Green } }
 function Write-Warn2($msg) { Write-Host "[deploy] $msg" -ForegroundColor Yellow }
+function Write-Err2($msg) { Write-Host "[deploy] $msg" -ForegroundColor Red }
+
+# -- pre-deploy validation -------------------------------------------------
+# Known-bad identifiers (constants / interfaces / methods we've discovered
+# do NOT exist in our Altium build). Each one of these is a *compile-time*
+# error that prevents the whole script project from loading -- Try/Except
+# inside the script can NOT catch it, and the polling loop never starts.
+# Catching them here at deploy time saves the user from having to recover
+# from a frozen Altium.
+#
+# When you confirm a new identifier crashes the script, add it here with
+# the date + a one-line note so future deploys never ship the same break.
+$KnownBadIdentifiers = @(
+    @{ Token = 'eDatafileLink';     Note = '2026-04: undeclared on Altium 25; ISch_Implementation has no factory-creatable datafile-link. Set the path via the SchLib UI or wrap libs in a .LibPkg.' },
+    @{ Token = 'ISch_DatafileLink'; Note = '2026-04: undeclared interface name -- declaring a Var of this type prevents script compile.' }
+)
+
+function Test-Pas-Identifiers {
+    # Returns an array of human-readable issue strings; empty array == clean.
+    # We strip DelphiScript comments first (both { ... } and (* ... *), which
+    # can span multiple lines) so doc-comments referencing these tokens for
+    # explanation aren't false positives. Then we re-walk the original file
+    # line by line, but only flag lines that ALSO appear as code in the
+    # stripped version (matched by exact line content + nearest-line lookup).
+    $issues = @()
+    if (-not (Test-Path $SrcDir)) { return ,$issues }
+    Get-ChildItem -Path $SrcDir -Filter "*.pas" -File | ForEach-Object {
+        $file = $_
+        $raw  = Get-Content -Raw $file.FullName
+        # Replace block-comment contents with same-length whitespace runs so
+        # line numbers stay aligned to the original file.
+        $stripped = [regex]::Replace($raw, '\{[^}]*\}', { param($m) ' ' * $m.Length })
+        $stripped = [regex]::Replace($stripped, '\(\*.*?\*\)', { param($m) ' ' * $m.Length }, 'Singleline')
+        $lines = $stripped -split "`r?`n"
+        for ($i = 0; $i -lt $lines.Length; $i++) {
+            $line = $lines[$i]
+            # Also strip end-of-line // comments.
+            $line = $line -replace '//.*$', ''
+            foreach ($bad in $KnownBadIdentifiers) {
+                $tok = [regex]::Escape($bad.Token)
+                if ($line -match "\b$tok\b") {
+                    $issues += "  $($file.Name):$($i+1)  uses '$($bad.Token)' -- $($bad.Note)"
+                }
+            }
+        }
+    }
+    return ,$issues
+}
 
 function Deploy-Scripts {
     if (-not (Test-Path $SrcDir)) {
         Write-Error "Source dir not found: $SrcDir"
     }
+
+    # Pre-flight: refuse to ship known-bad identifiers. A single compile
+    # error makes the whole script project unloadable in Altium and there
+    # is no in-script recovery possible -- the only fix is editing the
+    # .pas, redeploying, and reloading the script project. So we'd rather
+    # fail noisily here than silently push a broken build.
+    $issues = Test-Pas-Identifiers
+    if ($issues.Count -gt 0) {
+        Write-Err2 "Pre-deploy check FAILED -- found known-bad identifiers:"
+        foreach ($issue in $issues) { Write-Err2 $issue }
+        Write-Err2 "Fix the .pas files above and re-run deploy. (See dev/deploy.ps1 \$KnownBadIdentifiers for context on each token.)"
+        Write-Error "Pre-deploy validation failed."
+    }
+
     if (-not (Test-Path $DstDir)) {
         Write-Info "Creating destination: $DstDir"
         New-Item -ItemType Directory -Path $DstDir -Force | Out-Null

@@ -4,12 +4,12 @@ object StatusForm: TStatusForm
   BorderIcons = [biSystemMenu, biMinimize]
   BorderStyle = bsSizeable
   Caption = 'EDA Agent MCP'
-  ClientHeight = 540
-  ClientWidth = 340
-  Color = $001E1E1E
+  ClientHeight = 620
+  ClientWidth = 480
+  Color = $00141414
   Font.Charset = DEFAULT_CHARSET
-  Font.Color = $00E0E0E0
-  Font.Height = -11
+  Font.Color = $00E8E8E8
+  Font.Height = -12
   Font.Name = 'Segoe UI'
   Font.Style = []
   FormStyle = fsStayOnTop
@@ -17,42 +17,75 @@ object StatusForm: TStatusForm
   ParentFont = False
   Position = poScreenCenter
   PixelsPerInch = 96
-  TextHeight = 13
+  TextHeight = 15
   OnClose = StatusFormClose
   object pnl_Top: TPanel
     Left = 0
     Top = 0
-    Width = 340
-    Height = 104
+    Width = 480
+    Height = 124
     Align = alTop
     BevelOuter = bvNone
-    Color = $00252526
+    Color = $001C1C1C
+    object pnl_StatusDot: TPanel
+      Left = 16
+      Top = 18
+      Width = 10
+      Height = 10
+      BevelOuter = bvNone
+      Caption = ''
+      Color = $0064C864
+    end
     object lbl_Status: TLabel
-      Left = 12
-      Top = 10
-      Width = 316
-      Height = 20
+      Left = 32
+      Top = 12
+      Width = 360
+      Height = 22
       AutoSize = False
       EllipsisPosition = epEndEllipsis
-      Caption = 'MCP: starting...'
+      Caption = 'EDA Agent MCP'
       Font.Charset = DEFAULT_CHARSET
-      Font.Color = $00F0D090
-      Font.Height = -14
+      Font.Color = $00F8F8F8
+      Font.Height = -16
       Font.Name = 'Segoe UI Semibold'
       Font.Style = []
       ParentFont = False
     end
-    object pnl_Stats: TPanel
-      Left = 10
-      Top = 34
-      Width = 320
-      Height = 46
+    object lbl_Version: TLabel
+      Left = 392
+      Top = 16
+      Width = 76
+      Height = 16
+      Alignment = taRightJustify
+      AutoSize = False
+      Caption = 'v?'
+      Font.Charset = DEFAULT_CHARSET
+      Font.Color = $00707070
+      Font.Height = -11
+      Font.Name = 'Consolas'
+      Font.Style = []
+      ParentFont = False
+    end
+    object pnl_Divider1: TPanel
+      Left = 16
+      Top = 42
+      Width = 448
+      Height = 1
       BevelOuter = bvNone
-      Color = $001A1A1A
+      Caption = ''
+      Color = $00282828
+    end
+    object pnl_Stats: TPanel
+      Left = 16
+      Top = 52
+      Width = 448
+      Height = 60
+      BevelOuter = bvNone
+      Color = $001C1C1C
       object lbl_LblUp: TLabel
         Left = 0
         Top = 4
-        Width = 80
+        Width = 112
         Height = 14
         Alignment = taCenter
         AutoSize = False
@@ -66,23 +99,23 @@ object StatusForm: TStatusForm
       end
       object lbl_ValUp: TLabel
         Left = 0
-        Top = 20
-        Width = 80
-        Height = 22
+        Top = 22
+        Width = 112
+        Height = 28
         Alignment = taCenter
         AutoSize = False
         Caption = '0s'
         Font.Charset = DEFAULT_CHARSET
-        Font.Color = $00E0E0E0
-        Font.Height = -15
+        Font.Color = $00F0F0F0
+        Font.Height = -19
         Font.Name = 'Consolas'
         Font.Style = []
         ParentFont = False
       end
       object lbl_LblReq: TLabel
-        Left = 80
+        Left = 112
         Top = 4
-        Width = 80
+        Width = 112
         Height = 14
         Alignment = taCenter
         AutoSize = False
@@ -95,24 +128,24 @@ object StatusForm: TStatusForm
         ParentFont = False
       end
       object lbl_ValReq: TLabel
-        Left = 80
-        Top = 20
-        Width = 80
-        Height = 22
+        Left = 112
+        Top = 22
+        Width = 112
+        Height = 28
         Alignment = taCenter
         AutoSize = False
         Caption = '0'
         Font.Charset = DEFAULT_CHARSET
-        Font.Color = $00E0E0E0
-        Font.Height = -15
+        Font.Color = $00F0F0F0
+        Font.Height = -19
         Font.Name = 'Consolas'
         Font.Style = []
         ParentFont = False
       end
       object lbl_LblMs: TLabel
-        Left = 160
+        Left = 224
         Top = 4
-        Width = 80
+        Width = 112
         Height = 14
         Alignment = taCenter
         AutoSize = False
@@ -125,24 +158,24 @@ object StatusForm: TStatusForm
         ParentFont = False
       end
       object lbl_ValMs: TLabel
-        Left = 160
-        Top = 20
-        Width = 80
-        Height = 22
+        Left = 224
+        Top = 22
+        Width = 112
+        Height = 28
         Alignment = taCenter
         AutoSize = False
         Caption = '0'
         Font.Charset = DEFAULT_CHARSET
-        Font.Color = $00E0E0E0
-        Font.Height = -15
+        Font.Color = $00F0F0F0
+        Font.Height = -19
         Font.Name = 'Consolas'
         Font.Style = []
         ParentFont = False
       end
       object lbl_LblStop: TLabel
-        Left = 240
+        Left = 336
         Top = 4
-        Width = 80
+        Width = 112
         Height = 14
         Alignment = taCenter
         AutoSize = False
@@ -155,47 +188,41 @@ object StatusForm: TStatusForm
         ParentFont = False
       end
       object lbl_ValStop: TLabel
-        Left = 240
-        Top = 20
-        Width = 80
-        Height = 22
+        Left = 336
+        Top = 22
+        Width = 112
+        Height = 28
         Alignment = taCenter
         AutoSize = False
         Caption = '60s'
         Font.Charset = DEFAULT_CHARSET
-        Font.Color = $00E0E0E0
-        Font.Height = -15
+        Font.Color = $00F0F0F0
+        Font.Height = -19
         Font.Name = 'Consolas'
         Font.Style = []
         ParentFont = False
       end
     end
+  end
+  object pnl_ErrBar: TPanel
+    Left = 0
+    Top = 124
+    Width = 480
+    Height = 24
+    Align = alTop
+    BevelOuter = bvNone
+    Color = $00141414
     object lbl_LastErr: TLabel
-      Left = 12
-      Top = 84
-      Width = 240
+      Left = 16
+      Top = 5
+      Width = 448
       Height = 14
       AutoSize = False
       EllipsisPosition = epEndEllipsis
       Caption = ''
       Font.Charset = DEFAULT_CHARSET
-      Font.Color = $006060FF
+      Font.Color = $005C7CFF
       Font.Height = -11
-      Font.Name = 'Consolas'
-      Font.Style = []
-      ParentFont = False
-    end
-    object lbl_Version: TLabel
-      Left = 256
-      Top = 84
-      Width = 74
-      Height = 14
-      Alignment = taRightJustify
-      AutoSize = False
-      Caption = 'v?'
-      Font.Charset = DEFAULT_CHARSET
-      Font.Color = $00606060
-      Font.Height = -10
       Font.Name = 'Consolas'
       Font.Style = []
       ParentFont = False
@@ -203,25 +230,25 @@ object StatusForm: TStatusForm
   end
   object pnl_Controls: TPanel
     Left = 0
-    Top = 104
-    Width = 340
-    Height = 60
+    Top = 148
+    Width = 480
+    Height = 56
     Align = alTop
     BevelOuter = bvNone
-    Color = $001E1E1E
+    Color = $00141414
     object btn_Detach: TPanel
-      Left = 10
-      Top = 4
-      Width = 72
-      Height = 24
+      Left = 16
+      Top = 8
+      Width = 96
+      Height = 32
       BevelOuter = bvNone
       Caption = 'Detach'
-      Color = $003A3A3A
+      Color = $003B2C2C
       Cursor = crHandPoint
       Font.Charset = DEFAULT_CHARSET
-      Font.Color = $00E0E0E0
-      Font.Height = -11
-      Font.Name = 'Segoe UI'
+      Font.Color = $00B0B0F8
+      Font.Height = -12
+      Font.Name = 'Segoe UI Semibold'
       Font.Style = []
       ParentFont = False
       TabOrder = 0
@@ -230,17 +257,17 @@ object StatusForm: TStatusForm
       OnMouseLeave = btn_DetachLeave
     end
     object btn_ClearLog: TPanel
-      Left = 88
-      Top = 4
-      Width = 60
-      Height = 24
+      Left = 120
+      Top = 8
+      Width = 96
+      Height = 32
       BevelOuter = bvNone
-      Caption = 'Clear'
-      Color = $003A3A3A
+      Caption = 'Clear log'
+      Color = $00282828
       Cursor = crHandPoint
       Font.Charset = DEFAULT_CHARSET
       Font.Color = $00E0E0E0
-      Font.Height = -11
+      Font.Height = -12
       Font.Name = 'Segoe UI'
       Font.Style = []
       ParentFont = False
@@ -250,17 +277,17 @@ object StatusForm: TStatusForm
       OnMouseLeave = btn_ClearLogLeave
     end
     object btn_ResetPerf: TPanel
-      Left = 154
-      Top = 4
-      Width = 80
-      Height = 24
+      Left = 224
+      Top = 8
+      Width = 96
+      Height = 32
       BevelOuter = bvNone
-      Caption = 'Reset Perf'
-      Color = $003A3A3A
+      Caption = 'Reset perf'
+      Color = $00282828
       Cursor = crHandPoint
       Font.Charset = DEFAULT_CHARSET
       Font.Color = $00E0E0E0
-      Font.Height = -11
+      Font.Height = -12
       Font.Name = 'Segoe UI'
       Font.Style = []
       ParentFont = False
@@ -269,44 +296,53 @@ object StatusForm: TStatusForm
       OnMouseEnter = btn_ResetPerfEnter
       OnMouseLeave = btn_ResetPerfLeave
     end
+  end
+  object pnl_Filters: TPanel
+    Left = 0
+    Top = 204
+    Width = 480
+    Height = 40
+    Align = alTop
+    BevelOuter = bvNone
+    Color = $00141414
     object chk_HidePings: TPanel
-      Left = 10
-      Top = 34
-      Width = 150
-      Height = 20
+      Left = 16
+      Top = 6
+      Width = 180
+      Height = 26
       BevelOuter = bvNone
       Alignment = taLeftJustify
       Caption = '  [x] Hide pings'
-      Color = $001E1E1E
+      Color = $00141414
       Cursor = crHandPoint
       Font.Charset = DEFAULT_CHARSET
-      Font.Color = $00D0D0D0
+      Font.Color = $00C8C8C8
       Font.Height = -11
       Font.Name = 'Consolas'
       Font.Style = []
       ParentFont = False
-      TabOrder = 3
+      TabOrder = 0
       OnClick = chk_HidePingsClick
       OnMouseEnter = chk_HidePingsEnter
       OnMouseLeave = chk_HidePingsLeave
     end
     object chk_OnlySlow: TPanel
-      Left = 170
-      Top = 34
-      Width = 160
-      Height = 20
+      Left = 200
+      Top = 6
+      Width = 200
+      Height = 26
       BevelOuter = bvNone
       Alignment = taLeftJustify
       Caption = '  [ ] Only >100ms'
-      Color = $001E1E1E
+      Color = $00141414
       Cursor = crHandPoint
       Font.Charset = DEFAULT_CHARSET
-      Font.Color = $00D0D0D0
+      Font.Color = $00C8C8C8
       Font.Height = -11
       Font.Name = 'Consolas'
       Font.Style = []
       ParentFont = False
-      TabOrder = 4
+      TabOrder = 1
       OnClick = chk_OnlySlowClick
       OnMouseEnter = chk_OnlySlowEnter
       OnMouseLeave = chk_OnlySlowLeave
@@ -314,25 +350,25 @@ object StatusForm: TStatusForm
   end
   object pnl_TabBar: TPanel
     Left = 0
-    Top = 164
-    Width = 340
-    Height = 24
+    Top = 244
+    Width = 480
+    Height = 32
     Align = alTop
     BevelOuter = bvNone
-    Color = $00252526
+    Color = $00141414
     object tab_Log: TPanel
-      Left = 0
+      Left = 16
       Top = 0
-      Width = 70
-      Height = 24
+      Width = 96
+      Height = 32
       BevelOuter = bvNone
       Alignment = taCenter
       Caption = 'Log'
-      Color = $001A1A1A
+      Color = $00141414
       Cursor = crHandPoint
       Font.Charset = DEFAULT_CHARSET
       Font.Color = $00F0D090
-      Font.Height = -11
+      Font.Height = -12
       Font.Name = 'Segoe UI Semibold'
       Font.Style = []
       ParentFont = False
@@ -342,18 +378,18 @@ object StatusForm: TStatusForm
       OnMouseLeave = tab_LogLeave
     end
     object tab_Perf: TPanel
-      Left = 70
+      Left = 112
       Top = 0
-      Width = 70
-      Height = 24
+      Width = 96
+      Height = 32
       BevelOuter = bvNone
       Alignment = taCenter
       Caption = 'Perf'
-      Color = $00252526
+      Color = $00141414
       Cursor = crHandPoint
       Font.Charset = DEFAULT_CHARSET
-      Font.Color = $00909090
-      Font.Height = -11
+      Font.Color = $00808080
+      Font.Height = -12
       Font.Name = 'Segoe UI'
       Font.Style = []
       ParentFont = False
@@ -362,15 +398,43 @@ object StatusForm: TStatusForm
       OnMouseEnter = tab_PerfEnter
       OnMouseLeave = tab_PerfLeave
     end
+    object pnl_TabUnderlineLog: TPanel
+      Left = 16
+      Top = 30
+      Width = 96
+      Height = 2
+      BevelOuter = bvNone
+      Caption = ''
+      Color = $00F0D090
+    end
+    object pnl_TabUnderlinePerf: TPanel
+      Left = 112
+      Top = 30
+      Width = 96
+      Height = 2
+      BevelOuter = bvNone
+      Caption = ''
+      Color = $00141414
+    end
+  end
+  object pnl_Divider2: TPanel
+    Left = 0
+    Top = 276
+    Width = 480
+    Height = 1
+    Align = alTop
+    BevelOuter = bvNone
+    Caption = ''
+    Color = $00282828
   end
   object mmo_Log: TMemo
     Left = 0
-    Top = 188
-    Width = 340
-    Height = 352
+    Top = 277
+    Width = 480
+    Height = 343
     Align = alClient
     BorderStyle = bsNone
-    Color = $001A1A1A
+    Color = $00181818
     Font.Charset = DEFAULT_CHARSET
     Font.Color = $00D4D4D4
     Font.Height = -11
@@ -383,12 +447,12 @@ object StatusForm: TStatusForm
   end
   object mmo_Perf: TMemo
     Left = 0
-    Top = 188
-    Width = 340
-    Height = 352
+    Top = 277
+    Width = 480
+    Height = 343
     Align = alClient
     BorderStyle = bsNone
-    Color = $001A1A1A
+    Color = $00181818
     Font.Charset = DEFAULT_CHARSET
     Font.Color = $00D4D4D4
     Font.Height = -11
