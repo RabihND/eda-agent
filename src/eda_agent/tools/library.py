@@ -383,20 +383,34 @@ def register_library_tools(mcp):
     ) -> dict[str, Any]:
         """Add a pad to the current footprint.
 
+        IMPORTANT — for any footprint with more than ~5 pads, prefer
+        ``lib_add_footprint_pads`` (batch). A 144-ball BGA built one pad
+        at a time is 144 LLM turns; with the batch tool it's one turn
+        plus one PreProcess/PostProcess + one save.
+
         Args:
-            designator: Pad designator (e.g., "1", "2")
+            designator: Pad designator — a single package-pad identifier
+                (e.g., "1", "2", "M11", "A4"). Comma-separated alias
+                strings ("A4,A6,B1") are REJECTED: each footprint pad
+                must map 1:1 to exactly one schematic pin.
             x: X coordinate in mils
             y: Y coordinate in mils
             x_size: Pad X size in mils
             y_size: Pad Y size in mils
             hole_size: Drill hole size in mils (0 for SMD)
             shape: Pad shape ("round", "rectangular", "octagonal")
-            layer: Layer ("TopLayer", "BottomLayer", "MultiLayer")
+            layer: Layer for SMD pads — "TopLayer" (default) or
+                "BottomLayer". Through-hole pads (hole_size > 0) are
+                automatically placed on MultiLayer regardless of this
+                value.
             rotation: Pad rotation in degrees
 
         Returns:
             Dictionary confirming pad addition
         """
+        designator = _validate_pin_designator(
+            designator, context=f"footprint pad"
+        )
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "library.add_footprint_pad",
@@ -413,6 +427,88 @@ def register_library_tools(mcp):
             },
         )
         return result
+
+    @mcp.tool()
+    async def lib_add_footprint_pads(
+        pads: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add MANY pads to the current footprint in ONE call.
+
+        PREFER THIS over looping ``lib_add_footprint_pad``. A 144-ball
+        BGA placed one pad at a time is 144 LLM turns; with this tool
+        it's one turn + one PreProcess/PostProcess + one save.
+
+        Args:
+            pads: List of pad dicts, each with:
+                - designator (str, required) — single package-pad
+                  identifier (e.g., "1", "M11", "A4"). Multi-pin alias
+                  strings like "A4,A6,B1" are REJECTED: each footprint
+                  pad must map 1:1 to exactly one schematic pin. For
+                  shared-net groups, emit one pad per package ball with
+                  unique designators.
+                - x, y       (int, mils) — pad center
+                - x_size, y_size (int, mils, default 60)
+                - hole_size  (int, mils, default 0 = SMD; >0 = TH)
+                - shape      (str, default "rectangular") — round /
+                  rectangular / octagonal
+                - layer      (str, default "TopLayer") — "TopLayer" or
+                  "BottomLayer" for SMD pads. Through-hole pads
+                  (hole_size > 0) automatically use MultiLayer.
+                - rotation   (float, default 0) — degrees
+
+        Example — 3-pin SOT-23::
+
+            lib_add_footprint_pads(pads=[
+                {"designator": "1", "x":  -38, "y":  -47, "x_size": 28, "y_size": 24},
+                {"designator": "2", "x":  -38, "y":   47, "x_size": 28, "y_size": 24},
+                {"designator": "3", "x":   38, "y":    0, "x_size": 28, "y_size": 24},
+            ])
+
+        Returns:
+            Dict with added, failed, total counts.
+        """
+        # Direct port of coffeenmusic/altium-mcp's pad input format:
+        #   "designator|xmm|ymm|wmm|hmm|shape"
+        # joined by "~~" across pads. Convert any mil-based input to mm
+        # since the .pas side uses MMsToCoord (matching reference verbatim).
+        MILS_PER_MM = 1000.0 / 25.4
+
+        def _to_mm(p: dict, key_mm: str, key_mils: str, default: float = 0.0) -> float:
+            if key_mm in p:
+                return float(p[key_mm])
+            if key_mils in p:
+                return float(p[key_mils]) / MILS_PER_MM
+            return default
+
+        def _shape_token(p: dict) -> str:
+            raw = str(p.get("shape", "rectangular")).lower()
+            if raw in ("round", "circle"):
+                return "Round"
+            if raw in ("oval", "obround", "rounded_rect"):
+                return "Oval"
+            return "Rect"
+
+        op_strs: list[str] = []
+        for idx, p in enumerate(pads):
+            desig = _validate_pin_designator(
+                p.get("designator", ""),
+                context=f"pads[{idx}]",
+            )
+            xmm = _to_mm(p, "x_mm", "x")
+            ymm = _to_mm(p, "y_mm", "y")
+            wmm = _to_mm(p, "x_size_mm", "x_size", default=0.6)
+            hmm = _to_mm(p, "y_size_mm", "y_size", default=0.6)
+            shape = _shape_token(p)
+            op_strs.append(f"{desig}|{xmm:g}|{ymm:g}|{wmm:g}|{hmm:g}|{shape}")
+
+        if not op_strs:
+            return {"error": "No pads provided", "added": 0}
+
+        bridge = get_bridge()
+        return await bridge.send_command_async(
+            "library.add_footprint_pads",
+            {"pads": "~~".join(op_strs)},
+        )
 
     @mcp.tool()
     async def lib_add_footprint_track(
@@ -487,6 +583,102 @@ def register_library_tools(mcp):
     # =========================================================================
 
     @mcp.tool()
+    async def lib_create_pcb_footprint(
+        name: str,
+        pads: list[dict[str, Any]],
+        description: str = "",
+        body_x_mm: float = 0.0,
+        body_y_mm: float = 0.0,
+        courtyard_excess_mm: float = 0.25,
+    ) -> dict[str, Any]:
+        """Create a PcbLib footprint atomically — pads + body outline +
+        courtyard + assembly + silkscreen + pin-1 marker + designator text.
+
+        Single atomic .pas call holds the IPCB_Component reference stable
+        through the entire operation, avoiding the stale-reference bug
+        that hits when creation and pad-population are split across two
+        MCP calls.
+
+        Geometry per IPC-7351 convention:
+          - Silkscreen body outline drawn AT body edge (Top Overlay).
+          - Assembly outline drawn AT body edge (Top Assembly / Mech 13).
+          - Courtyard drawn at body + ``courtyard_excess_mm`` on each side.
+          - Pad-center to silk distance therefore matches datasheet
+            "ball center to body edge" exactly (no inset offset error).
+
+        Args:
+            name: Footprint name (e.g. "BGA144C80P12X12_1000X1000X170").
+            pads: List of pad dicts. Each dict supports either mm-based
+                fields ``x_mm`` / ``y_mm`` / ``x_size_mm`` / ``y_size_mm``
+                OR mil-based ``x`` / ``y`` / ``x_size`` / ``y_size``
+                (the wrapper auto-converts mils → mm). Required key:
+                ``designator`` (single package-pad identifier — the 1:1
+                pin-to-pad validator runs here too). Optional ``shape``:
+                ``"round"`` (default for SMD circles), ``"oval"``,
+                ``"rectangular"``.
+            description: Footprint description shown in the library panel.
+            body_x_mm: Full body width in mm (the package's outer
+                dimension from the datasheet outline drawing). Silk and
+                assembly outlines draw at this size. 0 = auto-fit body
+                to pad bounding box plus a small margin.
+            body_y_mm: Full body height in mm. 0 = auto.
+            courtyard_excess_mm: IPC clearance added beyond body for the
+                courtyard outline. Default 0.25 mm (Nominal density).
+                Use 0.50 for Most density (wave-solder), 0.10 for Least
+                (handheld / fine-pitch BGA).
+
+        Returns:
+            Dict with success, footprint_name, pad_count, total,
+            body_width_mm, body_height_mm, courtyard_width_mm,
+            courtyard_height_mm.
+        """
+        if not pads:
+            raise InvalidParameterError("pads must contain at least one entry")
+
+        MILS_PER_MM = 1000.0 / 25.4
+
+        def _to_mm(p: dict, key_mm: str, key_mils: str, default: float = 0.0) -> float:
+            if key_mm in p:
+                return float(p[key_mm])
+            if key_mils in p:
+                return float(p[key_mils]) / MILS_PER_MM
+            return default
+
+        def _shape_token(p: dict) -> str:
+            raw = str(p.get("shape", "round")).lower()
+            if raw in ("round", "circle"):
+                return "Round"
+            if raw in ("oval", "obround", "rounded_rect"):
+                return "Oval"
+            return "Rect"
+
+        op_strs: list[str] = []
+        for idx, p in enumerate(pads):
+            desig = _validate_pin_designator(
+                p.get("designator", ""),
+                context=f"pads[{idx}]",
+            )
+            xmm = _to_mm(p, "x_mm", "x")
+            ymm = _to_mm(p, "y_mm", "y")
+            wmm = _to_mm(p, "x_size_mm", "x_size", default=0.6)
+            hmm = _to_mm(p, "y_size_mm", "y_size", default=0.6)
+            shape = _shape_token(p)
+            op_strs.append(f"{desig}|{xmm:g}|{ymm:g}|{wmm:g}|{hmm:g}|{shape}")
+
+        bridge = get_bridge()
+        return await bridge.send_command_async(
+            "library.create_pcb_footprint",
+            {
+                "name": name,
+                "description": description,
+                "pads": "~~".join(op_strs),
+                "body_x_mm": body_x_mm,
+                "body_y_mm": body_y_mm,
+                "courtyard_excess_mm": courtyard_excess_mm,
+            },
+        )
+
+    @mcp.tool()
     async def lib_link_footprint(
         component_name: str,
         footprint_name: str,
@@ -502,7 +694,12 @@ def register_library_tools(mcp):
             component_name: Name of the schematic component (currently ignored —
                 see note above)
             footprint_name: Name of the footprint to link
-            footprint_library: Library containing the footprint (optional if same library)
+            footprint_library: Full path or filename of the .PcbLib that
+                contains the footprint. When provided, an explicit datafile
+                link is written so the SchLib editor's preview pane can
+                render the footprint thumbnail without a parent .LibPkg
+                project. Leave empty to rely on Available Libraries / open
+                PcbLibs / a parent LibPkg for resolution.
 
         Returns:
             Dictionary confirming link
@@ -559,6 +756,234 @@ def register_library_tools(mcp):
                 "rotation_x": rotation_x,
                 "rotation_y": rotation_y,
                 "rotation_z": rotation_z,
+            },
+        )
+        return result
+
+    @mcp.tool()
+    async def lib_position_3d_body(
+        target_x_mm: float = 0.0,
+        target_y_mm: float = 0.0,
+    ) -> dict[str, Any]:
+        """Center every 3D body on the active footprint at (target_x, target_y).
+
+        Use this after manually placing a 3D body via Altium's
+        ``Place → 3D Body → Embed STEP`` UI when the body lands off-origin.
+        Reads each body's bounding rectangle and moves the centroid to
+        the requested target. Default (0, 0) puts the body on the
+        footprint origin (where the pads sit).
+
+        ROTATION NOTE: The `rotation_z_deg` parameter has been removed
+        because `Model.SetState` rotates around the model's local origin
+        (not the body's anchor), causing translation that's hard to
+        compensate for across repeated calls. For rotation, use
+        Altium's UI: click the 3D body → F11 → Properties → set Z
+        rotation directly. Altium's own rotation logic handles this
+        correctly without translation drift.
+
+        Args:
+            target_x_mm: Target X for the body centroid, in mm. Default 0.
+            target_y_mm: Target Y for the body centroid, in mm. Default 0.
+
+        Returns:
+            Dictionary with ``moved`` (number of bodies recentered) and
+            the target coordinates.
+        """
+        bridge = get_bridge()
+        result = await bridge.send_command_async(
+            "library.position_3d_body",
+            {
+                "target_x_mm": target_x_mm,
+                "target_y_mm": target_y_mm,
+                "rotation_z_deg": 0,     # leave rotation alone
+                "skip_move": "false",
+            },
+        )
+        return result
+
+    @mcp.tool()
+    async def lib_screenshot_footprint(output_path: str) -> dict[str, Any]:
+        """Capture the current PcbLib editor view (2D or 3D) to a PNG.
+
+        Implementation: uses Win32 GDI BitBlt against the Altium window
+        (pattern from coffeenmusic/altium-mcp). The DelphiScript broker
+        approach didn't work on this build; Python-side capture is more
+        reliable since it bypasses Altium's own export pipeline.
+
+        Whatever mode the PcbLib editor is currently in (2D or 3D) is what
+        gets captured. To inspect 3D body orientation, switch to 3D mode in
+        Altium first (press 3) before calling this.
+
+        Args:
+            output_path: Absolute path where the PNG should be written
+                (e.g., ``C:/temp/ad9361_3d.png``).
+
+        Returns:
+            Dictionary with the output path and window dimensions on success.
+        """
+        # First, make sure the PcbLib doc is focused so we capture the right view.
+        bridge = get_bridge()
+        try:
+            await bridge.send_command_async("library.screenshot_footprint", {"output_path": output_path})
+        except Exception:
+            pass  # The .pas-side broker is best-effort; we capture from Python regardless.
+
+        try:
+            import win32gui
+            import win32ui
+            import win32con
+            from PIL import Image
+        except ImportError as e:
+            return {
+                "success": False,
+                "error": f"Missing dependency: {e}. Install with: pip install pywin32 Pillow",
+            }
+
+        # Find the Altium main window. Match on "Altium Designer" in the title.
+        altium_windows = []
+        altium_fallback = []
+
+        def _collect(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd)
+            if "Altium" in title and (".PcbLib" in title or ".PrjPcb" in title or ".PcbDoc" in title):
+                altium_windows.append((hwnd, title))
+            elif "Altium" in title:
+                altium_fallback.append((hwnd, title))
+            return True
+
+        win32gui.EnumWindows(_collect, 0)
+        candidates = altium_windows or altium_fallback
+        if not candidates:
+            return {"success": False, "error": "No Altium window found"}
+
+        hwnd, title = candidates[0]
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        w, h = right - left, bottom - top
+        if w <= 0 or h <= 0:
+            return {"success": False, "error": f"Bad window dims {w}x{h}"}
+
+        # Bring it forward so we capture the actual rendered content (not occluded).
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass  # foreground change can fail under various Win32 focus rules; carry on.
+
+        import time
+        time.sleep(0.3)  # let the WM repaint after focus change
+
+        # GDI BitBlt the window contents into a bitmap, then PIL it out.
+        hwndDC = win32gui.GetWindowDC(hwnd)
+        try:
+            mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+            saveDC = mfcDC.CreateCompatibleDC()
+            bmp = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(mfcDC, w, h)
+            saveDC.SelectObject(bmp)
+            saveDC.BitBlt((0, 0), (w, h), mfcDC, (0, 0), win32con.SRCCOPY)
+
+            info = bmp.GetInfo()
+            bits = bmp.GetBitmapBits(True)
+            img = Image.frombuffer(
+                "RGB",
+                (info["bmWidth"], info["bmHeight"]),
+                bits, "raw", "BGRX", 0, 1,
+            )
+
+            from pathlib import Path
+            out = Path(output_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            img.save(str(out), "PNG")
+
+            return {
+                "success": True,
+                "output_path": str(out),
+                "width": w,
+                "height": h,
+                "window_title": title,
+            }
+        finally:
+            try: win32gui.DeleteObject(bmp.GetHandle())
+            except Exception: pass
+            try: saveDC.DeleteDC()
+            except Exception: pass
+            try: mfcDC.DeleteDC()
+            except Exception: pass
+            try: win32gui.ReleaseDC(hwnd, hwndDC)
+            except Exception: pass
+
+    @mcp.tool()
+    async def lib_diag_footprint() -> dict[str, Any]:
+        """Diagnostic: list 3D bodies on the active PcbLib footprint.
+
+        Returns the body count, identifier, layer, and a has_model flag
+        for each ``IPCB_ComponentBody`` primitive on the focused
+        footprint. Use to debug "body was added but invisible" — tells
+        you whether the STEP actually loaded into Body.Model and which
+        layer the body landed on.
+
+        Returns:
+            Dictionary with ``body_count``, ``total_primitives``, and
+            a ``bodies`` array.
+        """
+        bridge = get_bridge()
+        result = await bridge.send_command_async("library.diag_footprint", {})
+        return result
+
+    @mcp.tool()
+    async def lib_add_3d_body(
+        model_path: str,
+        offset_x_mm: float = 0.0,
+        offset_y_mm: float = 0.0,
+        rot_z_deg: float = 0.0,
+        standoff_mm: float = 0.0,
+        overall_height_mm: float = 0.0,
+        mech_layer: int = 1,
+    ) -> dict[str, Any]:
+        """Embed a STEP / 3D model as a Component Body on the active PcbLib footprint.
+
+        Operates on the focused footprint in the PCB library editor. Open
+        the target footprint in the PcbLib panel before calling. The body
+        is anchored at the footprint origin and inherits the part's overall
+        rotation when placed on a board.
+
+        Unlike `lib_link_3d_model` (which adds a schematic-side reference
+        only), this writes the actual 3D primitive into the footprint, so
+        every placed instance carries the geometry automatically.
+
+        Args:
+            model_path: Absolute path to the STEP / .stp / .step file.
+            offset_x_mm: X offset of the model relative to footprint origin (mm).
+            offset_y_mm: Y offset of the model relative to footprint origin (mm).
+            rot_z_deg: Rotation around Z axis (degrees) — typical knob to align
+                the imported model with the pad layout.
+            standoff_mm: Body standoff height above the board (mm). 0 for typical
+                surface-mount; > 0 for parts on plastic standoffs.
+            overall_height_mm: Optional explicit body overall height (mm) for
+                3D-collision DRC. Leave 0 to use the value from the STEP.
+            mech_layer: Mechanical layer number to place the body on. The
+                3D-rendering engine reads bodies from whichever mechanical
+                layer is configured as the "Top 3D Body" component-layer
+                pair in the library's Layer Stack Manager. Default 1
+                (Altium's global default). Some templates use 2 (commonly
+                paired with M3 for the bottom). Look at View Configuration
+                → Component Layer Pairs to find the right one for your lib.
+
+        Returns:
+            Dictionary confirming the body was attached.
+        """
+        bridge = get_bridge()
+        result = await bridge.send_command_async(
+            "library.add_3d_body",
+            {
+                "model_path": model_path,
+                "offset_x_mm": offset_x_mm,
+                "offset_y_mm": offset_y_mm,
+                "rot_z_deg": rot_z_deg,
+                "standoff_mm": standoff_mm,
+                "overall_height_mm": overall_height_mm,
+                "mech_layer": mech_layer,
             },
         )
         return result

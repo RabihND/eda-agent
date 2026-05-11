@@ -204,6 +204,27 @@ Begin
     Try ServerDoc.SetModified(True); Except End;
 End;
 
+{ SaveDocByPathNow — like SaveDocByPath but also flushes to disk
+  immediately. Use this when the standard "mark modified, flush via
+  save_all later" pattern doesn't apply because:
+    a) The document is standalone (not part of any project), so
+       SaveAllDirty's project-walk skips it entirely.
+    b) Altium's editor auto-syncs the document's in-memory state from
+       its on-disk content, so leaving the disk file stale means the
+       in-memory edits get wiped a few seconds later.
+  PcbLib documents opened standalone hit both — without an immediate
+  DoFileSave the freshly-added pads/tracks evaporate from the panel. }
+Procedure SaveDocByPathNow(FilePath : String);
+Var
+    ServerDoc : IServerDocument;
+Begin
+    If FilePath = '' Then Exit;
+    ServerDoc := Client.GetDocumentByPath(FilePath);
+    If ServerDoc = Nil Then Exit;
+    Try ServerDoc.SetModified(True); Except End;
+    Try ServerDoc.DoFileSave(''); Except End;
+End;
+
 { Walk every open logical document in the focused workspace and call         }
 { DoFileSave on the ones whose Modified flag is set. This is the explicit    }
 { flush that replaces the per-mutation save.                                 }

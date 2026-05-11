@@ -13,6 +13,7 @@ Examples:
     py dev\smoke.py call lib_get_components "{}"
     py dev\smoke.py scenario quad_opamp
     py dev\smoke.py scenario ad9361
+    py dev\smoke.py scenario ad9361_footprint
 
 Environment:
     EDA_AGENT_EXE    override path to eda-agent.exe (default: detect from PATH)
@@ -629,6 +630,145 @@ def _scenario_ad9361(client: MCPClient) -> int:
         return 1
 
 
+def _scenario_ad9361_footprint(client: MCPClient) -> int:
+    """Build the AD9361 144-ball CSP_BGA footprint in the active PcbLib.
+
+    Datasheet source — AD9361 Rev. G, Figure 76 (Outline Dimensions,
+    package option BC-144-7):
+
+      - 144-ball CSP_BGA, body 10.0 mm × 10.0 mm × 1.7 mm max
+      - BGA matrix 8.80 mm × 8.80 mm
+      - Ball pitch 0.80 mm
+      - Ball diameter 0.40 / 0.45 / 0.50 mm
+      - 12 rows × 12 columns (rows lettered A,B,C,D,E,F,G,H,J,K,L,M;
+        the letter 'I' is skipped per BGA convention to avoid confusion
+        with column '1')
+
+    Naive-user benchmark for the footprint side: this scenario stands
+    in for "create the AD9361 footprint from the datasheet" — datasheet
+    values up top, one batch call to place all 144 pads, four
+    silkscreen tracks for the body outline.
+
+    Requires an open .PcbLib document in Altium (File → New → Library
+    → PCB Library, save as PcbLib1.PcbLib next to your SchLib).
+    """
+    print("--- ad9361_footprint scenario ---")
+    print("Pre-flight checks:")
+
+    ping = _call_tool(client, "ping_altium", {})
+    all_ok = _check(
+        "Altium script responding",
+        bool(ping.get("success")) if isinstance(ping, dict) else False,
+        f"version={ping.get('altium_script_version')}" if isinstance(ping, dict) else str(ping),
+    )
+
+    active = _call_tool(client, "get_active_document", {})
+    is_pcblib = isinstance(active, dict) and active.get("document_kind") == "PCBLIB"
+    all_ok &= _check(
+        "Active document is a PcbLib",
+        is_pcblib,
+        f"file_name={active.get('file_name')}, kind={active.get('document_kind')}"
+        if isinstance(active, dict) else str(active),
+    )
+    if not all_ok:
+        print("Pre-flight failed. Open or create a .PcbLib in Altium first:")
+        print("  File → New → Library → PCB Library, then save it.")
+        return 1
+
+    # ---- Datasheet values (mm) ----
+    PITCH_MM = 0.80
+    BALL_DIAM_MM = 0.45
+    BODY_MM = 10.0
+    ROW_LETTERS = "ABCDEFGHJKLM"   # 12 rows, no 'I'
+    N_COLS = 12
+
+    # ---- Convert mm to mils for the MCP API ----
+    MILS_PER_MM = 1000.0 / 25.4    # 39.3700787...
+    def mm_to_mils(mm: float) -> int:
+        return int(round(mm * MILS_PER_MM))
+
+    PITCH_MILS = mm_to_mils(PITCH_MM)             # ~31 mils
+    PAD_MILS = mm_to_mils(BALL_DIAM_MM)           # ~18 mils
+    BODY_HALF_MILS = mm_to_mils(BODY_MM / 2.0)    # ~197 mils
+
+    n_rows = len(ROW_LETTERS)
+    n_cols = N_COLS
+    half_grid_w = ((n_cols - 1) * PITCH_MILS) // 2
+    half_grid_h = ((n_rows - 1) * PITCH_MILS) // 2
+
+    # A1 in the top-left when viewed from top: row A is +y, col 1 is -x.
+    # Build pads in mm directly (lib_create_pcb_footprint takes mm-based fields).
+    half_grid_w_mm = ((n_cols - 1) * PITCH_MM) / 2.0
+    half_grid_h_mm = ((n_rows - 1) * PITCH_MM) / 2.0
+    pads = []
+    for r, letter in enumerate(ROW_LETTERS):
+        y_mm = half_grid_h_mm - r * PITCH_MM
+        for c in range(1, n_cols + 1):
+            x_mm = -half_grid_w_mm + (c - 1) * PITCH_MM
+            pads.append({
+                "designator": f"{letter}{c}",
+                "x_mm": x_mm, "y_mm": y_mm,
+                "x_size_mm": BALL_DIAM_MM, "y_size_mm": BALL_DIAM_MM,
+                "shape": "round",
+            })
+
+    print(f"\nBuilding AD9361_CSP_BGA_144 atomically via lib_create_pcb_footprint:")
+    print(f"  {len(pads)} pads, body {BODY_MM}mm × {BODY_MM}mm, pitch {PITCH_MM}mm")
+
+    # Single atomic call — footprint creation + 144 pads + body outline +
+    # assembly outline + courtyard + pin-1 marker + designator text.
+    # body_x_mm / body_y_mm are the package's full dimensions from the
+    # datasheet outline drawing (10×10mm here). Silk and assembly draw AT
+    # the body edge so pad-center to silk distance matches the datasheet's
+    # "ball center to body edge" of 0.6mm. Courtyard auto-computes as
+    # body + 0.25mm (IPC Nominal density default).
+    pads_result = _call_tool(client, "lib_create_pcb_footprint", {
+        "name": "AD9361_CSP_BGA_144",
+        "description": "AD9361 RF Agile Transceiver — 144-ball CSP_BGA, 10mm × 10mm, 0.8mm pitch (BC-144-7)",
+        "pads": pads,
+        "body_x_mm": BODY_MM,
+        "body_y_mm": BODY_MM,
+        "courtyard_excess_mm": 0.25,
+    })
+    print(f"\nlib_create_pcb_footprint result:")
+    print(json.dumps(pads_result, indent=2))
+
+    if not (isinstance(pads_result, dict) and pads_result.get("success")):
+        print("FAILED: lib_create_pcb_footprint did not report success.")
+        return 1
+
+    track_results = []  # placeholder for assertion below
+
+    # ---- Assertions ----
+    expected_pads = n_rows * n_cols  # 144
+    passed = True
+    passed &= _check(
+        f"{expected_pads} pads added atomically",
+        isinstance(pads_result, dict) and pads_result.get("pad_count") == expected_pads,
+        f"got pad_count={pads_result.get('pad_count') if isinstance(pads_result, dict) else pads_result!r}",
+    )
+    passed &= _check(
+        f"all {expected_pads} pads accepted (total = pad_count)",
+        isinstance(pads_result, dict)
+        and pads_result.get("total") == expected_pads
+        and pads_result.get("pad_count") == expected_pads,
+        f"got total={pads_result.get('total') if isinstance(pads_result, dict) else pads_result!r}, pad_count={pads_result.get('pad_count') if isinstance(pads_result, dict) else pads_result!r}",
+    )
+
+    print()
+    if passed:
+        print("All assertions passed. Manual check: open Altium, find")
+        print("AD9361_CSP_BGA_144 in the PcbLib panel and verify visually:")
+        print(f"  - 12×12 round pads at ~{PITCH_MILS} mil pitch (0.80 mm)")
+        print(f"  - Pad designators A1..M12 (rows skip 'I'; 144 total)")
+        print(f"  - {2 * BODY_HALF_MILS} × {2 * BODY_HALF_MILS} mil body outline (10mm × 10mm)")
+        print(f"  - All pads on TopLayer (SMD)")
+        return 0
+    else:
+        print("One or more assertions failed — see output above.")
+        return 1
+
+
 def cmd_scenario(client: MCPClient, name: str):
     """Pre-baked test scenarios. Add new ones here as we build features."""
     if name == "ping":
@@ -640,9 +780,11 @@ def cmd_scenario(client: MCPClient, name: str):
         sys.exit(_scenario_quad_opamp(client))
     elif name == "ad9361":
         sys.exit(_scenario_ad9361(client))
+    elif name == "ad9361_footprint":
+        sys.exit(_scenario_ad9361_footprint(client))
     else:
         print(f"unknown scenario: {name}")
-        print("known: ping, quad_opamp, ad9361")
+        print("known: ping, quad_opamp, ad9361, ad9361_footprint")
         sys.exit(2)
 
 

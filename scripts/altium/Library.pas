@@ -303,7 +303,15 @@ Begin
         Footprint.Description := Description;
 
         PcbLib.RegisterComponent(Footprint);
+        { Broadcast component-registration to the board so the editor and
+          panels pick up the new footprint. Without this the footprint
+          appears in the list but isn't fully bound, so primitives added
+          to it later don't persist. Target = Board, event data = Footprint
+          (per coffeenmusic/altium-mcp's CreatePCBFootprint pattern). }
+        PCBServer.SendMessageToRobots(PcbLib.Board.I_ObjectAddress, c_Broadcast,
+            PCBM_BoardRegisteration, Footprint.I_ObjectAddress);
         PcbLib.CurrentComponent := Footprint;
+        PcbLib.Board.ViewManager_FullUpdate;
 
         Result := BuildSuccessResponse(RequestId, '{"success":true,"name":"' + EscapeJsonString(Name) + '"}');
     End
@@ -319,6 +327,7 @@ Var
     PcbLib : IPCB_Library;
     Footprint : IPCB_LibComponent;
     Pad : IPCB_Pad;
+    PadLayer : TLayer;
 Begin
     Designator := ExtractJsonValue(Params, 'designator');
     X := StrToIntDef(ExtractJsonValue(Params, 'x'), 0);
@@ -329,6 +338,16 @@ Begin
     Shape := ExtractJsonValue(Params, 'shape');
     LayerStr := ExtractJsonValue(Params, 'layer');
     Rotation := StrToFloatDef(ExtractJsonValue(Params, 'rotation'), 0);
+
+    { Without an explicit Pad.Layer the pad is created but doesn't render
+      and isn't counted in the PcbLib panel. Through-hole = MultiLayer,
+      SMD goes to Top or Bottom based on the layer string. }
+    If HoleSize > 0 Then
+        PadLayer := eMultiLayer
+    Else If LayerStr = 'BottomLayer' Then
+        PadLayer := eBottomLayer
+    Else
+        PadLayer := eTopLayer;
 
     PcbLib := PCBServer.GetCurrentPCBLibrary;
     If PcbLib = Nil Then
@@ -344,32 +363,40 @@ Begin
         Exit;
     End;
 
-    PCBServer.PreProcess;
-
+    { Match coffeenmusic/altium-mcp's CreatePCBFootprint pattern verbatim:
+      no PreProcess/PostProcess (those wrap an undo transaction that can
+      roll back our changes), per-pad broadcast with target=Pad and
+      event=c_NoEventData, then a final component-level broadcast and a
+      ViewManager_FullUpdate. SaveDocByPathNow at the end is our addition
+      for autonomous flow (standalone PcbLibs aren't covered by save_all). }
     Pad := PCBServer.PCBObjectFactory(ePadObject, eNoDimension, eCreate_Default);
     If Pad <> Nil Then
     Begin
         Pad.Name := Designator;
+        Pad.Mode := ePadMode_Simple;
+        Pad.HoleSize := MilsToCoord(HoleSize);
         Pad.X := MilsToCoord(X);
         Pad.Y := MilsToCoord(Y);
+        Pad.Layer := PadLayer;
         Pad.TopXSize := MilsToCoord(XSize);
         Pad.TopYSize := MilsToCoord(YSize);
-        Pad.HoleSize := MilsToCoord(HoleSize);
-        Pad.Rotation := Rotation;
-
         If Shape = 'rectangular' Then Pad.TopShape := eRectangular
         Else If Shape = 'octagonal' Then Pad.TopShape := eOctagonal
+        Else If Shape = 'rounded_rect' Then Pad.TopShape := eRoundedRectangle
         Else Pad.TopShape := eRounded;
 
         Footprint.AddPCBObject(Pad);
+        PCBServer.SendMessageToRobots(Pad.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+        { Tell the board the footprint changed (component-level). }
+        PCBServer.SendMessageToRobots(PcbLib.Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Footprint.I_ObjectAddress);
+        PcbLib.CurrentComponent := Footprint;
+        PcbLib.Board.ViewManager_FullUpdate;
 
         Result := BuildSuccessResponse(RequestId, '{"success":true,"designator":"' + EscapeJsonString(Designator) + '"}');
     End
     Else
         Result := BuildErrorResponse(RequestId, 'CREATE_FAILED', 'Failed to create pad');
-
-    PCBServer.PostProcess;
-    SaveDocByPath(PcbLib.Board.FileName);
 End;
 
 Function Lib_AddFootprintTrack(Params : String; RequestId : String) : String;
@@ -405,8 +432,6 @@ Begin
     If LayerStr = 'BottomOverlay' Then Layer := eBottomOverlay
     Else Layer := eTopOverlay;
 
-    PCBServer.PreProcess;
-
     Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
     If Track <> Nil Then
     Begin
@@ -418,14 +443,14 @@ Begin
         Track.Layer := Layer;
 
         Footprint.AddPCBObject(Track);
+        PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+        PCBServer.SendMessageToRobots(PcbLib.Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Footprint.I_ObjectAddress);
+        PcbLib.Board.ViewManager_FullUpdate;
 
         Result := BuildSuccessResponse(RequestId, '{"success":true}');
     End
     Else
         Result := BuildErrorResponse(RequestId, 'CREATE_FAILED', 'Failed to create track');
-
-    PCBServer.PostProcess;
-    SaveDocByPath(PcbLib.Board.FileName);
 End;
 
 Function Lib_AddFootprintArc(Params : String; RequestId : String) : String;
@@ -462,8 +487,6 @@ Begin
     If LayerStr = 'BottomOverlay' Then Layer := eBottomOverlay
     Else Layer := eTopOverlay;
 
-    PCBServer.PreProcess;
-
     Arc := PCBServer.PCBObjectFactory(eArcObject, eNoDimension, eCreate_Default);
     If Arc <> Nil Then
     Begin
@@ -476,14 +499,506 @@ Begin
         Arc.Layer := Layer;
 
         Footprint.AddPCBObject(Arc);
+        PCBServer.SendMessageToRobots(Arc.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+        PCBServer.SendMessageToRobots(PcbLib.Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, Footprint.I_ObjectAddress);
+        PcbLib.Board.ViewManager_FullUpdate;
 
         Result := BuildSuccessResponse(RequestId, '{"success":true}');
     End
     Else
         Result := BuildErrorResponse(RequestId, 'CREATE_FAILED', 'Failed to create arc');
+End;
 
-    PCBServer.PostProcess;
-    SaveDocByPath(PcbLib.Board.FileName);
+{..............................................................................}
+{ Lib_AddFootprintPads - Bulk add pads to the currently-selected PCB footprint. }
+{ One PreProcess/PostProcess + one save for the whole batch, so a 144-ball BGA }
+{ costs ~1x the overhead of placing one pad. Mirrors Lib_AddPins on the SchLib }
+{ side. Designator validation (no comma-separated multi-pad aliases) is        }
+{ enforced on the Python side via _validate_pin_designator before the batch    }
+{ payload reaches here.                                                        }
+{ Params: pads = '~~'-separated list; each pad has key=value fields joined by  }
+{         ';'. Fields: designator, x, y, x_size, y_size (mils), hole_size      }
+{         (mils, 0=SMD), shape (round/rectangular/octagonal), layer            }
+{         (currently ignored — matches singular Lib_AddFootprintPad behavior), }
+{         rotation (degrees, float).                                           }
+{..............................................................................}
+
+Function Lib_AddFootprintPads(Params : String; RequestId : String) : String;
+Var
+    PadsStr, PadData, ShapeStr, PadNum : String;
+    XMM, YMM, WMM, HMM : Double;
+    PadShape : TShape;
+    Fields : TStringList;
+    PcbLib : IPCB_Library;
+    LibComp : IPCB_Component;
+    Pad : IPCB_Pad;
+    Added, OpCount : Integer;
+    I, J, FieldStart : Integer;
+Begin
+    PadsStr := ExtractJsonValue(Params, 'pads');
+    If PadsStr = '' Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'MISSING_PARAM', 'pads is required');
+        Exit;
+    End;
+
+    PcbLib := PCBServer.GetCurrentPCBLibrary;
+    If PcbLib = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_PCBLIB', 'No PCB library is active');
+        Exit;
+    End;
+
+    LibComp := PcbLib.CurrentComponent;
+    If LibComp = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_FOOTPRINT', 'No footprint is selected');
+        Exit;
+    End;
+
+    Added := 0;
+    OpCount := 0;
+
+    { Direct port of coffeenmusic/altium-mcp's CreatePCBFootprint pad-loop.
+      Input format per pad (joined by '~~' across pads):
+        "designator|xmm|ymm|wmm|hmm|shape"
+      Where shape is "Round" / "Rect" / "Oval". Coordinates in mm
+      (matches reference's MMsToCoord usage). The Python wrapper handles
+      mil→mm conversion before sending. Per-pad sequence: factory create →
+      set props in coffeenmusic's exact order → AddPCBObject → broadcast. }
+    Fields := TStringList.Create;
+    Try
+        While PadsStr <> '' Do
+        Begin
+            J := Pos('~~', PadsStr);
+            If J > 0 Then
+            Begin
+                PadData := Copy(PadsStr, 1, J - 1);
+                PadsStr := Copy(PadsStr, J + 2, Length(PadsStr));
+            End
+            Else
+            Begin
+                PadData := PadsStr;
+                PadsStr := '';
+            End;
+            PadData := Trim(PadData);
+            If PadData = '' Then Continue;
+            OpCount := OpCount + 1;
+
+            Fields.Clear;
+            FieldStart := 1;
+            For I := 1 To Length(PadData) + 1 Do
+            Begin
+                If (I > Length(PadData)) Or (PadData[I] = '|') Then
+                Begin
+                    Fields.Add(Trim(Copy(PadData, FieldStart, I - FieldStart)));
+                    FieldStart := I + 1;
+                End;
+            End;
+
+            If Fields.Count < 5 Then Continue;
+
+            PadNum := Fields[0];
+            XMM := StrToFloatDef(Fields[1], 0);
+            YMM := StrToFloatDef(Fields[2], 0);
+            WMM := StrToFloatDef(Fields[3], 0);
+            HMM := StrToFloatDef(Fields[4], 0);
+            If Fields.Count >= 6 Then ShapeStr := Fields[5]
+            Else ShapeStr := 'Rect';
+
+            If ShapeStr = 'Round' Then PadShape := eRounded
+            Else If ShapeStr = 'Oval' Then PadShape := eRoundedRectangle
+            Else PadShape := eRectangular;
+
+            Pad := PCBServer.PCBObjectFactory(ePadObject, eNoDimension, eCreate_Default);
+            Pad.Name := PadNum;
+            Pad.Mode := ePadMode_Simple;
+            Pad.HoleSize := 0;
+            Pad.x := MMsToCoord(XMM);
+            Pad.y := MMsToCoord(YMM);
+            Pad.Layer := eTopLayer;
+            Pad.TopXSize := MMsToCoord(WMM);
+            Pad.TopYSize := MMsToCoord(HMM);
+            Pad.TopShape := PadShape;
+
+            LibComp.AddPCBObject(Pad);
+            PCBServer.SendMessageToRobots(Pad.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+            Added := Added + 1;
+        End;
+    Finally
+        Fields.Free;
+    End;
+
+    PCBServer.SendMessageToRobots(PcbLib.Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, LibComp.I_ObjectAddress);
+    PcbLib.CurrentComponent := LibComp;
+    PcbLib.Board.ViewManager_FullUpdate;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"added":' + IntToStr(Added) + ',"total":' + IntToStr(OpCount) + '}');
+End;
+
+{..............................................................................}
+{ Lib_CreatePCBFootprint — atomic footprint creation in ONE MCP call.          }
+{ Direct port of coffeenmusic/altium-mcp's CreatePCBFootprint. Holds the       }
+{ IPCB_Component reference from CreatePCBLibComp through the entire pad-add    }
+{ loop, avoiding the stale-reference problem that hits when creation and pad   }
+{ population are split across two MCP calls.                                   }
+{                                                                              }
+{ Params (JSON):                                                               }
+{   name              — footprint name (string, required)                      }
+{   description       — footprint description (string, optional)               }
+{   pads              — '~~'-joined list of '|'-separated pad records:         }
+{                       "designator|xmm|ymm|wmm|hmm|shape" where shape is     }
+{                       "Round" / "Rect" / "Oval"                               }
+{   body_x_mm         — full body width in mm (silk + assembly drawn here).    }
+{                       0 = auto-fit to pad bounding box.                       }
+{   body_y_mm         — full body height in mm. 0 = auto.                      }
+{   courtyard_excess_mm — IPC clearance added beyond body for the courtyard    }
+{                       outline (default 0.25 mm Nominal density).             }
+{                                                                              }
+{ Geometry: silkscreen + assembly outlines are drawn AT body edge (no inset    }
+{ — so pad-center-to-silk matches the datasheet's body-edge dimension).        }
+{ Courtyard is drawn at body + courtyard_excess_mm on each side.               }
+{..............................................................................}
+Function Lib_CreatePCBFootprint(Params : String; RequestId : String) : String;
+Var
+    Name, Description, PadsStr, PadData, ShapeStr, PadNum, S : String;
+    XMM, YMM, WMM, HMM : Double;
+    PadShape : TShape;
+    PadFields : TStringList;
+    PcbLib : IPCB_Library;
+    LibComp : IPCB_Component;
+    Pad : IPCB_Pad;
+    Track : IPCB_Track;
+    Pin1Arc : IPCB_Arc;
+    DesigText : IPCB_Text;
+    Added, Total : Integer;
+    I, J, FieldStart : Integer;
+    BodyXMM, BodyYMM, CourtyardExcess, TrackWMM : Double;
+    BodyX1, BodyX2, BodyY1, BodyY2 : Double;     { silk + assembly outline }
+    CrtX1, CrtX2, CrtY1, CrtY2 : Double;          { courtyard outline (body + excess) }
+    MaxX, MinX, MaxY, MinY : Double;
+    Pin1ChamferMM : Double;
+    SilkLayer : TLayer;
+Begin
+    Name := ExtractJsonValue(Params, 'name');
+    Description := ExtractJsonValue(Params, 'description');
+    PadsStr := ExtractJsonValue(Params, 'pads');
+    S := ExtractJsonValue(Params, 'body_x_mm');
+    BodyXMM := StrToFloatDef(S, 0);
+    S := ExtractJsonValue(Params, 'body_y_mm');
+    BodyYMM := StrToFloatDef(S, 0);
+    S := ExtractJsonValue(Params, 'courtyard_excess_mm');
+    CourtyardExcess := StrToFloatDef(S, 0.25);     { IPC Nominal density default }
+    TrackWMM := 0.1;                                { silk/assembly/courtyard line width }
+
+    If Name = '' Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'MISSING_PARAM', 'name is required');
+        Exit;
+    End;
+
+    PcbLib := PCBServer.GetCurrentPCBLibrary;
+    If PcbLib = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_PCBLIB', 'No PCB library is active');
+        Exit;
+    End;
+
+    Added := 0;
+    Total := 0;
+    MaxX := -1.0E9; MaxY := -1.0E9;
+    MinX :=  1.0E9; MinY :=  1.0E9;
+    SilkLayer := String2Layer('Top Overlay');
+
+    { Create + register footprint, hold the LibComp ref through the
+      whole function so the pads-list inserts hit the right object. }
+    LibComp := PCBServer.CreatePCBLibComp;
+    LibComp.Name := Name;
+    PcbLib.RegisterComponent(LibComp);
+
+    PadFields := TStringList.Create;
+    Try
+        While PadsStr <> '' Do
+        Begin
+            J := Pos('~~', PadsStr);
+            If J > 0 Then
+            Begin
+                PadData := Copy(PadsStr, 1, J - 1);
+                PadsStr := Copy(PadsStr, J + 2, Length(PadsStr));
+            End
+            Else
+            Begin
+                PadData := PadsStr;
+                PadsStr := '';
+            End;
+            PadData := Trim(PadData);
+            If PadData = '' Then Continue;
+            Total := Total + 1;
+
+            PadFields.Clear;
+            FieldStart := 1;
+            For I := 1 To Length(PadData) + 1 Do
+            Begin
+                If (I > Length(PadData)) Or (PadData[I] = '|') Then
+                Begin
+                    PadFields.Add(Trim(Copy(PadData, FieldStart, I - FieldStart)));
+                    FieldStart := I + 1;
+                End;
+            End;
+
+            If PadFields.Count < 5 Then Continue;
+
+            PadNum := PadFields[0];
+            XMM := StrToFloatDef(PadFields[1], 0);
+            YMM := StrToFloatDef(PadFields[2], 0);
+            WMM := StrToFloatDef(PadFields[3], 0);
+            HMM := StrToFloatDef(PadFields[4], 0);
+            If PadFields.Count >= 6 Then ShapeStr := PadFields[5]
+            Else ShapeStr := 'Rect';
+
+            If ShapeStr = 'Round' Then PadShape := eRounded
+            Else If ShapeStr = 'Oval' Then PadShape := eRoundedRectangle
+            Else PadShape := eRectangular;
+
+            Pad := PCBServer.PCBObjectFactory(ePadObject, eNoDimension, eCreate_Default);
+            Pad.Name := PadNum;
+            Pad.Mode := ePadMode_Simple;
+            Pad.HoleSize := 0;
+            Pad.x := MMsToCoord(XMM);
+            Pad.y := MMsToCoord(YMM);
+            Pad.Layer := eTopLayer;
+            Pad.TopXSize := MMsToCoord(WMM);
+            Pad.TopYSize := MMsToCoord(HMM);
+            Pad.TopShape := PadShape;
+
+            LibComp.AddPCBObject(Pad);
+            PCBServer.SendMessageToRobots(Pad.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+            Added := Added + 1;
+
+            If (XMM - WMM/2) < MinX Then MinX := XMM - WMM/2;
+            If (YMM - HMM/2) < MinY Then MinY := YMM - HMM/2;
+            If (XMM + WMM/2) > MaxX Then MaxX := XMM + WMM/2;
+            If (YMM + HMM/2) > MaxY Then MaxY := YMM + HMM/2;
+        End;
+    Finally
+        PadFields.Free;
+    End;
+
+    { Body outline (silk + assembly drawn AT body edge — no inset, so
+      pad-center-to-silk distance matches the datasheet's body-edge
+      dimension exactly). }
+    If (BodyXMM > 0) And (BodyYMM > 0) Then
+    Begin
+        BodyX1 := -BodyXMM / 2.0; BodyX2 := BodyXMM / 2.0;
+        BodyY1 := -BodyYMM / 2.0; BodyY2 := BodyYMM / 2.0;
+    End
+    Else If Added > 0 Then
+    Begin
+        { Auto-fit body to pad bounding box + a small margin. }
+        BodyX1 := MinX - 0.25; BodyX2 := MaxX + 0.25;
+        BodyY1 := MinY - 0.25; BodyY2 := MaxY + 0.25;
+    End
+    Else
+    Begin
+        BodyX1 := -1; BodyX2 := 1; BodyY1 := -1; BodyY2 := 1;
+    End;
+
+    { Courtyard = body + IPC clearance on each side. }
+    CrtX1 := BodyX1 - CourtyardExcess; CrtX2 := BodyX2 + CourtyardExcess;
+    CrtY1 := BodyY1 - CourtyardExcess; CrtY2 := BodyY2 + CourtyardExcess;
+
+    { 4 courtyard tracks on Mechanical 15 (IPC convention). }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(15);
+    Track.x1 := MMsToCoord(CrtX1); Track.y1 := MMsToCoord(CrtY1);
+    Track.x2 := MMsToCoord(CrtX2); Track.y2 := MMsToCoord(CrtY1);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(15);
+    Track.x1 := MMsToCoord(CrtX2); Track.y1 := MMsToCoord(CrtY1);
+    Track.x2 := MMsToCoord(CrtX2); Track.y2 := MMsToCoord(CrtY2);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(15);
+    Track.x1 := MMsToCoord(CrtX2); Track.y1 := MMsToCoord(CrtY2);
+    Track.x2 := MMsToCoord(CrtX1); Track.y2 := MMsToCoord(CrtY2);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(15);
+    Track.x1 := MMsToCoord(CrtX1); Track.y1 := MMsToCoord(CrtY2);
+    Track.x2 := MMsToCoord(CrtX1); Track.y2 := MMsToCoord(CrtY1);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { ----- Silkscreen body outline on Top Overlay — IPC pin-1 chamfered
+      corner at the top-left. Chamfer size sized so the diagonal stays
+      in the corner space BEFORE the first pad row (= less than the
+      ball-to-edge distance, which for a typical fine-pitch BGA is
+      ~0.6mm). 0.5mm chamfer keeps clear of pads even at 0.5mm pitch. }
+    Pin1ChamferMM := 0.5;
+    { Bottom edge (full length). }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := SilkLayer;
+    Track.x1 := MMsToCoord(BodyX1); Track.y1 := MMsToCoord(BodyY1);
+    Track.x2 := MMsToCoord(BodyX2); Track.y2 := MMsToCoord(BodyY1);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { Right edge (full length). }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := SilkLayer;
+    Track.x1 := MMsToCoord(BodyX2); Track.y1 := MMsToCoord(BodyY1);
+    Track.x2 := MMsToCoord(BodyX2); Track.y2 := MMsToCoord(BodyY2);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { Top edge (shortened on left for chamfer). }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := SilkLayer;
+    Track.x1 := MMsToCoord(BodyX2); Track.y1 := MMsToCoord(BodyY2);
+    Track.x2 := MMsToCoord(BodyX1 + Pin1ChamferMM); Track.y2 := MMsToCoord(BodyY2);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { 45° chamfer at top-left corner — pin-1 indicator. }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := SilkLayer;
+    Track.x1 := MMsToCoord(BodyX1 + Pin1ChamferMM); Track.y1 := MMsToCoord(BodyY2);
+    Track.x2 := MMsToCoord(BodyX1); Track.y2 := MMsToCoord(BodyY2 - Pin1ChamferMM);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { Left edge (shortened on top for chamfer). }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := SilkLayer;
+    Track.x1 := MMsToCoord(BodyX1); Track.y1 := MMsToCoord(BodyY2 - Pin1ChamferMM);
+    Track.x2 := MMsToCoord(BodyX1); Track.y2 := MMsToCoord(BodyY1);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { ----- Assembly outline on Top Assembly (Mech 13) — at body edge. }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(13);
+    Track.x1 := MMsToCoord(BodyX1); Track.y1 := MMsToCoord(BodyY1);
+    Track.x2 := MMsToCoord(BodyX2); Track.y2 := MMsToCoord(BodyY1);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(13);
+    Track.x1 := MMsToCoord(BodyX2); Track.y1 := MMsToCoord(BodyY1);
+    Track.x2 := MMsToCoord(BodyX2); Track.y2 := MMsToCoord(BodyY2);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(13);
+    Track.x1 := MMsToCoord(BodyX2); Track.y1 := MMsToCoord(BodyY2);
+    Track.x2 := MMsToCoord(BodyX1); Track.y2 := MMsToCoord(BodyY2);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(13);
+    Track.x1 := MMsToCoord(BodyX1); Track.y1 := MMsToCoord(BodyY2);
+    Track.x2 := MMsToCoord(BodyX1); Track.y2 := MMsToCoord(BodyY1);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { ----- Pin-1 indicator on Top Assembly — small triangle in the
+      top-left corner (IPC convention). Diagonal + two short closing
+      edges so the triangle is unambiguous on the assembly drawing. Same
+      Pin1ChamferMM as silk → never crosses pad A1. }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(13);
+    Track.x1 := MMsToCoord(BodyX1); Track.y1 := MMsToCoord(BodyY2 - Pin1ChamferMM);
+    Track.x2 := MMsToCoord(BodyX1 + Pin1ChamferMM); Track.y2 := MMsToCoord(BodyY2);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { Short top edge of triangle: from corner along top to the diagonal apex. }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(13);
+    Track.x1 := MMsToCoord(BodyX1); Track.y1 := MMsToCoord(BodyY2);
+    Track.x2 := MMsToCoord(BodyX1 + Pin1ChamferMM); Track.y2 := MMsToCoord(BodyY2);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { Short left edge of triangle: from corner down to the diagonal apex. }
+    Track := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Track.Layer := ILayer.MechanicalLayer(13);
+    Track.x1 := MMsToCoord(BodyX1); Track.y1 := MMsToCoord(BodyY2);
+    Track.x2 := MMsToCoord(BodyX1); Track.y2 := MMsToCoord(BodyY2 - Pin1ChamferMM);
+    Track.Width := MMsToCoord(TrackWMM);
+    LibComp.AddPCBObject(Track);
+    PCBServer.SendMessageToRobots(Track.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    { ----- Pin-1 marker — solid filled dot just outside the chamfered
+      top-left corner. We achieve "filled" by setting LineWidth equal to
+      2 × Radius so the ring's inner edge collapses to the centre and the
+      whole disc is painted. Anchor: just outside the chamfer apex. }
+    If Added > 0 Then
+    Begin
+        Pin1Arc := PCBServer.PCBObjectFactory(eArcObject, eNoDimension, eCreate_Default);
+        Pin1Arc.Layer := SilkLayer;
+        Pin1Arc.XCenter := MMsToCoord(BodyX1 - 0.3);
+        Pin1Arc.YCenter := MMsToCoord(BodyY2 + 0.3);
+        Pin1Arc.Radius := MMsToCoord(0.15);
+        Pin1Arc.LineWidth := MMsToCoord(0.30);   { = 2 * Radius → solid disc }
+        Pin1Arc.StartAngle := 0;
+        Pin1Arc.EndAngle := 360;
+        LibComp.AddPCBObject(Pin1Arc);
+        PCBServer.SendMessageToRobots(Pin1Arc.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+    End;
+
+    { ----- Designator text "(.Designator)" on Top Assembly (Mech 13).
+      The leading "." special string is replaced with the placed-component's
+      designator at schematic-bind time. Place it centered, sized to the
+      footprint width. ----- }
+    DesigText := PCBServer.PCBObjectFactory(eTextObject, eNoDimension, eCreate_Default);
+    DesigText.Text := '.Designator';
+    DesigText.Layer := ILayer.MechanicalLayer(13);
+    DesigText.XLocation := MMsToCoord(CrtX1 + 0.5);
+    DesigText.YLocation := MMsToCoord(0);
+    DesigText.Size := MMsToCoord(1.0);
+    DesigText.Width := MMsToCoord(0.15);
+    LibComp.AddPCBObject(DesigText);
+    PCBServer.SendMessageToRobots(DesigText.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, c_NoEventData);
+
+    PCBServer.SendMessageToRobots(PcbLib.Board.I_ObjectAddress, c_Broadcast, PCBM_BoardRegisteration, LibComp.I_ObjectAddress);
+    PcbLib.CurrentComponent := LibComp;
+    PcbLib.Board.ViewManager_FullUpdate;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"success":true,"footprint_name":"' + EscapeJsonString(Name) +
+        '","pad_count":' + IntToStr(Added) +
+        ',"total":' + IntToStr(Total) +
+        ',"body_width_mm":' + FloatToStr(BodyX2 - BodyX1) +
+        ',"body_height_mm":' + FloatToStr(BodyY2 - BodyY1) +
+        ',"courtyard_width_mm":' + FloatToStr(CrtX2 - CrtX1) +
+        ',"courtyard_height_mm":' + FloatToStr(CrtY2 - CrtY1) + '}');
 End;
 
 Function Lib_LinkFootprint(Params : String; RequestId : String) : String;
@@ -495,6 +1010,7 @@ Var
 Begin
     FootprintName := ExtractJsonValue(Params, 'footprint_name');
     LibraryName := ExtractJsonValue(Params, 'library_name');
+    LibraryName := StringReplace(LibraryName, '\\', '\', -1);
 
     SchLib := SchServer.GetCurrentSchDocument;
     If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
@@ -510,23 +1026,43 @@ Begin
         Exit;
     End;
 
-    Impl := SchServer.SchObjectFactory(eImplementation, eCreate_Default);
-    If Impl <> Nil Then
+    Impl := Nil;
+    Try
+        Impl := SchServer.SchObjectFactory(eImplementation, eCreate_Default);
+    Except
+        Result := BuildErrorResponse(RequestId, 'LINK_FAILED', 'SchObjectFactory(eImplementation) raised');
+        Exit;
+    End;
+
+    If Impl = Nil Then
     Begin
+        Result := BuildErrorResponse(RequestId, 'LINK_FAILED', 'Failed to link footprint');
+        Exit;
+    End;
+
+    Try
         Impl.ModelName := FootprintName;
-        Impl.ModelType := cDocKind_PcbLib;
-        If LibraryName <> '' Then
-        Begin
-            Impl.UseComponentLibrary := False;
-            Impl.LibraryIdentifier := LibraryName;
-        End;
+        Impl.ModelType := 'PCBLIB';
+        Impl.IsCurrent := True;
         Component.AddSchObject(Impl);
         SchRegisterObject(Component, Impl);
+    Except
+        Result := BuildErrorResponse(RequestId, 'IMPL_BIND_FAILED', 'Failed to attach implementation to component');
+        Exit;
+    End;
 
-        Result := BuildSuccessResponse(RequestId, '{"success":true,"footprint":"' + EscapeJsonString(FootprintName) + '"}');
-    End
-    Else
-        Result := BuildErrorResponse(RequestId, 'LINK_FAILED', 'Failed to link footprint');
+    { NOTE: Earlier we tried to also write an explicit ISch_DatafileLink
+      with the .PcbLib path so the SchLib editor preview pane could
+      resolve the footprint without a parent .LibPkg. That code path
+      crashed the script — likely because `eDatafileLink` is not a
+      compiler-declared constant on this Altium build (a compile-time
+      error Try/Except can't catch). For now the link is name-only;
+      preview works once the user adds the path via the SchLib UI's
+      "Add Footprint → Specified" dialog, or once the SchLib + PcbLib
+      are wrapped in a parent .LibPkg project. The `library_name`
+      argument is currently ignored. }
+
+    Result := BuildSuccessResponse(RequestId, '{"success":true,"footprint":"' + EscapeJsonString(FootprintName) + '"}');
 End;
 
 Function Lib_Link3DModel(Params : String; RequestId : String) : String;
@@ -567,6 +1103,393 @@ Begin
     End
     Else
         Result := BuildErrorResponse(RequestId, 'LINK_FAILED', 'Failed to link 3D model');
+End;
+
+{..............................................................................}
+{ Lib_Add3DBody — embed a STEP file as a 3D body on the active PcbLib            }
+{ footprint. Operates on PcbLib.CurrentComponent (the focused footprint in       }
+{ the PcbLib editor). Body is anchored at the footprint origin by default;       }
+{ pass offset_x_mm / offset_y_mm to nudge, rot_z_deg to rotate around Z          }
+{ (most common — part orientation), standoff_mm for the body height above the    }
+{ board (typically 0 for surface-mount, > 0 for parts on standoffs).             }
+{                                                                                }
+{ Pattern follows community-validated DelphiScript:                              }
+{   ModelFactory_FromFilename → SetState_FromModel → Body.Model := <model>       }
+{ This is the same flow Add → 3D Body → Generic in the Altium UI uses.           }
+{..............................................................................}
+Function Lib_Add3DBody(Params : String; RequestId : String) : String;
+Var
+    ModelPath, S : String;
+    Standoff, Overall, RotZ : Double;
+    MechLayerNum : Integer;
+    PcbLib : IPCB_Library;
+    LibComp : IPCB_LibComponent;
+    Body : IPCB_ComponentBody;
+    Model : IPCB_Model;
+    AView : IServerDocumentView;
+    AServerDocument : IServerDocument;
+Begin
+    ModelPath := ExtractJsonValue(Params, 'model_path');
+    ModelPath := StringReplace(ModelPath, '\\', '\', -1);
+    S := ExtractJsonValue(Params, 'standoff_mm');
+    Standoff := StrToFloatDef(S, 0);
+    S := ExtractJsonValue(Params, 'overall_height_mm');
+    Overall := StrToFloatDef(S, 0);
+    S := ExtractJsonValue(Params, 'mech_layer');
+    MechLayerNum := StrToIntDef(S, 1);    { default Mechanical 1; many libs use 2 for "Top 3D Body" }
+    S := ExtractJsonValue(Params, 'rot_z_deg');
+    RotZ := StrToFloatDef(S, 0);
+
+    If ModelPath = '' Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'MISSING_PARAM', 'model_path is required');
+        Exit;
+    End;
+    If Not FileExists(ModelPath) Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'FILE_NOT_FOUND', 'STEP file does not exist: ' + ModelPath);
+        Exit;
+    End;
+
+    PcbLib := PCBServer.GetCurrentPCBLibrary;
+    If PcbLib = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_PCBLIB', 'No PCB library is active');
+        Exit;
+    End;
+
+    LibComp := PcbLib.CurrentComponent;
+    If LibComp = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_FOOTPRINT', 'No footprint is selected in the PCB library');
+        Exit;
+    End;
+
+    { Granular Try/Except blocks: when an Altium API method raises (or
+      DelphiScript can't coerce a return type), the script IDE pops a
+      modal dialog. Without local Try/Except the polling loop hangs
+      after dismissing the dialog. With small Try/Except around each
+      risky call, clicking OK on the dialog lets execution fall into
+      the local Except branch, the function returns a proper error
+      response, and the polling loop resumes. }
+    { Verified pattern from Altium-Designer-addons/scripts-libraries
+      SPI_Cleanup_LPW_Footprint.pas (which credits AutoSTEPplacer.pas):
+        1. Create body
+        2. Set BodyProjection + Layer + opacity BEFORE model load
+        3. ModelFactory_FromFilename → SetState_FromModel → Model.SetState(rotation) → Body.Model := Model
+        4. SetState_Identifier(name) — METHOD form, NOT direct property assignment
+        5. LibComp.AddPCBObject(Body)
+        6. Mark IServerDocument.Modified := True so the 3D engine commits + re-renders
+        7. ViewManager_FullUpdate                                                  }
+
+    Body := Nil;
+    Try
+        Body := PCBServer.PCBObjectFactory(eComponentBodyObject, eNoDimension, eCreate_Default);
+    Except
+        Result := BuildErrorResponse(RequestId, 'BODY_CREATE_FAILED', 'PCBObjectFactory raised on eComponentBodyObject');
+        Exit;
+    End;
+    If Body = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'BODY_CREATE_FAILED', 'Failed to create component body');
+        Exit;
+    End;
+
+    { Side + layer + opacity BEFORE the model load. The verified working
+      script does it in this order; doing it after the load gets the
+      values clobbered. }
+    Try Body.BodyProjection := eBoardSide_Top; Except End;
+    Try Body.Layer := ILayer.MechanicalLayer(MechLayerNum); Except End;
+    Try Body.BodyOpacity3D := 1.0; Except End;
+
+    Try
+        { Second arg = embed flag. True embeds the STEP geometry into
+          the PcbLib (loads + stores the parsed shapes); False creates
+          a "linked" reference that may not render unless the file is
+          on the project's search path. AutoSTEPplacer uses False but
+          renders via DoFileSave. We use True for full self-contained
+          bodies that render in the PcbLib editor. }
+        Model := Body.ModelFactory_FromFilename(ModelPath, True);
+    Except
+        Result := BuildErrorResponse(RequestId, 'STEP_LOAD_FAILED', 'ModelFactory_FromFilename raised on: ' + ModelPath);
+        Exit;
+    End;
+    Try
+        Body.SetState_FromModel;
+        { ALWAYS call Model.SetState — verified pattern calls it
+          unconditionally, before Body.Model := Model. This might be
+          the trigger that actually parses the STEP geometry; without
+          it, the Model is just a path reference with no shapes loaded.
+          Args: (Xrot, Yrot, Zrot, ZOffsetCoord). }
+        Model.SetState(0, 0, RotZ, MMsToCoord(Standoff));
+        Body.Model := Model;
+    Except
+        Result := BuildErrorResponse(RequestId, 'BODY_BIND_FAILED', 'SetState_FromModel / Body.Model raised — likely STEP file invalid or geometry empty');
+        Exit;
+    End;
+
+    { Skip SetState_Identifier — the working reference body has an
+      empty identifier ("") and renders fine. Setting it on ours
+      doesn't change visibility but is one less variable to consider. }
+
+    Try
+        If Standoff > 0 Then Body.StandoffHeight := MMsToCoord(Standoff);
+        If Overall  > 0 Then Body.OverallHeight  := MMsToCoord(Overall);
+    Except End;
+
+    Try
+        LibComp.AddPCBObject(Body);
+    Except
+        Result := BuildErrorResponse(RequestId, 'ADD_PCB_OBJECT_FAILED', 'LibComp.AddPCBObject(Body) raised');
+        Exit;
+    End;
+
+    { CRITICAL: mark the IServerDocument as modified. Without this, the
+      3D engine treats the in-memory body as ghosted and never includes
+      it in the rendered scene — explaining "body added but invisible". }
+    Try
+        AView := Client.GetCurrentView;
+        If AView <> Nil Then
+        Begin
+            AServerDocument := AView.OwnerDocument;
+            If AServerDocument <> Nil Then AServerDocument.Modified := True;
+        End;
+    Except End;
+
+    Try PcbLib.Board.ViewManager_FullUpdate; Except End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"success":true,"model_path":"' + EscapeJsonString(ModelPath) +
+        '","standoff_mm":' + FloatToStr(Standoff) +
+        ',"overall_height_mm":' + FloatToStr(Overall) + '}');
+End;
+
+
+{..............................................................................}
+{ Lib_DiagFootprint — list every primitive on the active PcbLib footprint with    }
+{ its ObjectId, Layer, and (for ComponentBody) Identifier + a flag indicating    }
+{ whether a Model is attached. Diagnostic-only — used to debug "the body was     }
+{ added but doesn't render": tells us what layer it's on, whether the STEP       }
+{ actually loaded into Body.Model, etc.                                           }
+{..............................................................................}
+Function Lib_DiagFootprint(Params : String; RequestId : String) : String;
+Var
+    PcbLib : IPCB_Library;
+    LibComp : IPCB_LibComponent;
+    Iter : IPCB_GroupIterator;
+    Prim : IPCB_Primitive;
+    Body : IPCB_ComponentBody;
+    JSON, Entry, ObjStr, LayerStr, BBoxStr, HeightStr, ExtraStr : String;
+    NumBodies, NumTotal : Integer;
+    HasModel : Boolean;
+    BRect : TCoordRect;
+Begin
+    PcbLib := PCBServer.GetCurrentPCBLibrary;
+    If PcbLib = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_PCBLIB', 'No PCB library is active');
+        Exit;
+    End;
+    LibComp := PcbLib.CurrentComponent;
+    If LibComp = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_FOOTPRINT', 'No footprint is selected');
+        Exit;
+    End;
+
+    NumBodies := 0;
+    NumTotal := 0;
+    JSON := '"bodies":[';
+
+    Iter := LibComp.GroupIterator_Create;
+    Try
+        Iter.AddFilter_ObjectSet(MkSet(eComponentBodyObject));
+        Prim := Iter.FirstPCBObject;
+        While Prim <> Nil Do
+        Begin
+            NumTotal := NumTotal + 1;
+            Body := Prim;
+            If NumBodies > 0 Then JSON := JSON + ',';
+
+            LayerStr := '?';
+            Try LayerStr := GetLayerString(Body.Layer); Except End;
+            ObjStr := '';
+            Try ObjStr := Body.Identifier; Except End;
+
+            HasModel := False;
+            Try If Body.Model <> Nil Then HasModel := True; Except End;
+
+            BBoxStr := '';
+            Try
+                BRect := Body.BoundingRectangle;
+                BBoxStr := ',"bbox_w_mm":' + FloatToStr(CoordToMMs(BRect.Right - BRect.Left)) +
+                           ',"bbox_h_mm":' + FloatToStr(CoordToMMs(BRect.Top - BRect.Bottom));
+            Except End;
+
+            HeightStr := '';
+            Try HeightStr := ',"overall_height_mm":' + FloatToStr(CoordToMMs(Body.OverallHeight)); Except End;
+
+            { Extra diagnostic properties — used to compare a working body
+              against a non-rendering one to find the differentiating prop. }
+            { BodyOpacity3D / Kind / Is3DBody / BodyProjection / StandoffHeight
+              property reads triggered an ADVPCB.DLL access violation.
+              Try/Except can't catch native AVs. Removed. Stick to
+              OverallHeight + BoundingRectangle which we've confirmed work. }
+            ExtraStr := '';
+
+            If HasModel Then
+                Entry := '{"identifier":"' + EscapeJsonString(ObjStr) +
+                         '","layer":"'    + EscapeJsonString(LayerStr) +
+                         '","has_model":true' + BBoxStr + HeightStr + ExtraStr + '}'
+            Else
+                Entry := '{"identifier":"' + EscapeJsonString(ObjStr) +
+                         '","layer":"'    + EscapeJsonString(LayerStr) +
+                         '","has_model":false' + BBoxStr + HeightStr + ExtraStr + '}';
+            JSON := JSON + Entry;
+            NumBodies := NumBodies + 1;
+            Prim := Iter.NextPCBObject;
+        End;
+    Finally
+        LibComp.GroupIterator_Destroy(Iter);
+    End;
+
+    JSON := '{"body_count":' + IntToStr(NumBodies) + ',' + JSON + ']}';
+    Result := BuildSuccessResponse(RequestId, JSON);
+End;
+
+{..............................................................................}
+{ Lib_Position3DBody — move every 3D body on the active footprint so its         }
+{ centroid lands at (target_x_mm, target_y_mm). Use after a manual               }
+{ Place > 3D Body if the body landed off-origin. The footprint's pads sit at     }
+{ the footprint origin (0,0 by default), so passing default 0,0 centers the      }
+{ body on top of the pads.                                                        }
+{                                                                                }
+{ Body.MoveToXY takes the SOUTH-WEST corner of the body's bounding box, so we    }
+{ subtract half-width / half-height from the target to convert "centroid" intent }
+{ into the SW coord the API expects. (Pattern from SPI_Cleanup_LPW_Footprint.pas) }
+{..............................................................................}
+Function Lib_Position3DBody(Params : String; RequestId : String) : String;
+Var
+    PcbLib : IPCB_Library;
+    LibComp : IPCB_LibComponent;
+    Iter : IPCB_GroupIterator;
+    Body : IPCB_ComponentBody;
+    BRect : TCoordRect;
+    TargetX, TargetY, HalfW, HalfH, RotZ : Double;
+    SwX, SwY, CenterX, CenterY : Integer;
+    Moved : Integer;
+    SkipMove : Boolean;
+    S : String;
+Begin
+    S := ExtractJsonValue(Params, 'target_x_mm');
+    TargetX := StrToFloatDef(S, 0);
+    S := ExtractJsonValue(Params, 'target_y_mm');
+    TargetY := StrToFloatDef(S, 0);
+    S := ExtractJsonValue(Params, 'rotation_z_deg');
+    RotZ := StrToFloatDef(S, 0);
+    { skip_move=true: only apply rotation, leave the body's existing
+      X/Y position alone. Useful when the user has already manually
+      placed the body at the right location and just needs orientation
+      fixed up. }
+    S := ExtractJsonValue(Params, 'skip_move');
+    SkipMove := (S = 'true') Or (S = '1');
+
+    PcbLib := PCBServer.GetCurrentPCBLibrary;
+    If PcbLib = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_PCBLIB', 'No PCB library is active');
+        Exit;
+    End;
+    LibComp := PcbLib.CurrentComponent;
+    If LibComp = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_FOOTPRINT', 'No footprint is selected');
+        Exit;
+    End;
+
+    Moved := 0;
+    Iter := LibComp.GroupIterator_Create;
+    Try
+        Iter.AddFilter_ObjectSet(MkSet(eComponentBodyObject));
+        Body := Iter.FirstPCBObject;
+        While Body <> Nil Do
+        Begin
+            Try
+                { ORDER MATTERS: rotate FIRST, then re-center. The model
+                  rotation (Model.SetState) may translate the body because
+                  the STEP origin isn't always at the geometric center.
+                  By doing rotation before MoveToXY, we let MoveToXY
+                  read the post-rotation bounding box and place the
+                  centroid exactly at (TargetX, TargetY). }
+
+                If RotZ <> 0 Then
+                Begin
+                    Try
+                        If Body.Model <> Nil Then
+                            Body.Model.SetState(0, 0, RotZ, 0);
+                    Except End;
+                End;
+
+                If Not SkipMove Then
+                Begin
+                    BRect := Body.BoundingRectangle;
+                    HalfW := CoordToMMs(BRect.Right - BRect.Left) / 2.0;
+                    HalfH := CoordToMMs(BRect.Top - BRect.Bottom) / 2.0;
+                    SwX := MMsToCoord(TargetX - HalfW);
+                    SwY := MMsToCoord(TargetY - HalfH);
+                    Body.MoveToXY(SwX, SwY);
+                End;
+
+                Moved := Moved + 1;
+            Except End;
+            Body := Iter.NextPCBObject;
+        End;
+    Finally
+        LibComp.GroupIterator_Destroy(Iter);
+    End;
+
+    Try PcbLib.Board.ViewManager_FullUpdate; Except End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"success":true,"moved":' + IntToStr(Moved) +
+        ',"target_x_mm":' + FloatToStr(TargetX) +
+        ',"target_y_mm":' + FloatToStr(TargetY) +
+        ',"rotation_z_deg":' + FloatToStr(RotZ) + '}');
+End;
+
+{..............................................................................}
+{ Lib_ScreenshotFootprint — capture the current PcbLib editor view (2D or 3D     }
+{ depending on which mode is active) to a PNG file. Used for AI-driven           }
+{ "is the 3D body oriented correctly relative to pin 1?" inspection — the        }
+{ multimodal agent reads the file, decides if a flip/rotation is needed, then    }
+{ calls position_3d_body with rotation_z_deg.                                    }
+{                                                                                }
+{ Implementation: uses the same WorkspaceManager:PrintCurrent process that the   }
+{ File → Page Setup → Preview → Save image dialog uses. Output format chosen     }
+{ by file extension (.png recommended).                                          }
+{..............................................................................}
+Function Lib_ScreenshotFootprint(Params : String; RequestId : String) : String;
+Var
+    OutputPath : String;
+    PcbLib : IPCB_Library;
+Begin
+    { Script-side just confirms the PcbLib is focused and forces a view
+      refresh. The actual screen capture happens on the Python side via
+      Win32 GDI BitBlt — that path is more reliable than any DelphiScript
+      export broker. (Pattern from coffeenmusic/altium-mcp.) }
+    OutputPath := ExtractJsonValue(Params, 'output_path');
+
+    PcbLib := PCBServer.GetCurrentPCBLibrary;
+    If PcbLib = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_PCBLIB', 'No PCB library is active');
+        Exit;
+    End;
+
+    Try PcbLib.Board.ViewManager_FullUpdate; Except End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"success":true,"ready_for_capture":true,"output_path":"' + EscapeJsonString(OutputPath) + '"}');
 End;
 
 Function Lib_GetComponents(Params : String; RequestId : String) : String;
@@ -1605,10 +2528,16 @@ Begin
         'add_symbol_line':      Result := Lib_AddSymbolLine(Params, RequestId);
         'create_footprint':     Result := Lib_CreateFootprint(Params, RequestId);
         'add_footprint_pad':    Result := Lib_AddFootprintPad(Params, RequestId);
+        'add_footprint_pads':   Result := Lib_AddFootprintPads(Params, RequestId);
+        'create_pcb_footprint': Result := Lib_CreatePCBFootprint(Params, RequestId);
         'add_footprint_track':  Result := Lib_AddFootprintTrack(Params, RequestId);
         'add_footprint_arc':    Result := Lib_AddFootprintArc(Params, RequestId);
         'link_footprint':       Result := Lib_LinkFootprint(Params, RequestId);
         'link_3d_model':        Result := Lib_Link3DModel(Params, RequestId);
+        'add_3d_body':          Result := Lib_Add3DBody(Params, RequestId);
+        'diag_footprint':       Result := Lib_DiagFootprint(Params, RequestId);
+        'position_3d_body':     Result := Lib_Position3DBody(Params, RequestId);
+        'screenshot_footprint': Result := Lib_ScreenshotFootprint(Params, RequestId);
         'get_components':       Result := Lib_GetComponents(Params, RequestId);
         'search':               Result := Lib_Search(Params, RequestId);
         'get_component_details': Result := Lib_GetComponentDetails(Params, RequestId);
