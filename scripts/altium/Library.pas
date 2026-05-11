@@ -4,6 +4,82 @@
 { Library.pas - Library management functions for the Altium integration bridge                }
 {..............................................................................}
 
+{ Set the part ownership fields on a primitive so the lib editor knows     }
+{ which part of the component it belongs to. Per Altium's official         }
+{ createcomp_in_lib.pas reference, primitives without OwnerPartId /        }
+{ OwnerPartDisplayMode are added to the component's collection but the    }
+{ editor can't display them, symbols appear empty.                        }
+Procedure SetOwnerPart(Obj : ISch_GraphicalObject; Component : ISch_Component);
+Begin
+    If Obj = Nil Then Exit;
+    If Component <> Nil Then
+    Begin
+        Try Obj.OwnerPartId := Component.CurrentPartID; Except End;
+        Try Obj.OwnerPartDisplayMode := Component.DisplayMode; Except End;
+    End
+    Else
+    Begin
+        Try Obj.OwnerPartId := 1; Except End;
+        Try Obj.OwnerPartDisplayMode := 0; Except End;
+    End;
+End;
+
+{ Resolve the target component for a Lib_Add* primitive helper.             }
+{                                                                              }
+{ SchLib.CurrentSchComponent in DelphiScript reflects the editor's selected }
+{ component, which doesn't update when we add a new component via           }
+{ AddSchComponent (the setter is a no-op). Trusting it would attach        }
+{ primitives to whatever the editor was showing first (usually the default  }
+{ Component_1 placeholder), leaving every newly-created symbol empty.       }
+{                                                                              }
+{ Use the global LastCreatedLibComponent we set in Lib_CreateSymbol         }
+{ instead, falling back to CurrentSchComponent only if nothing has been     }
+{ created in this session.                                                  }
+Function GetTargetLibComponent(SchLib : ISch_Lib) : ISch_Component;
+Begin
+    Result := LastCreatedLibComponent;
+    If Result = Nil Then
+    Begin
+        If SchLib <> Nil Then
+            Result := SchLib.CurrentSchComponent;
+    End;
+End;
+
+{ Mark the focused SchLib doc dirty without an immediate full-file save.    }
+{ DoFileSave on a multi-MB SchLib costs hundreds of milliseconds to seconds }
+{ per call, so doing it from every singular mutation (lib_add_pin,          }
+{ lib_set_component_description, lib_link_footprint, ...) made one-symbol-  }
+{ at-a-time editing unusable. Mirror the project-side deferred-save pattern }
+{ (perf_deferred_save): mutations only flag dirty, and `save_all` /         }
+{ SaveAllDirty flushes the .SchLib to disk at a logical checkpoint. The     }
+{ workspace's free-document save sweep already covers standalone libs, so   }
+{ no save_all changes are needed.                                            }
+Procedure MarkLibDirty(SchLib : ISch_Lib);
+Var
+    Workspace : IWorkspace;
+    Doc : IDocument;
+    FullPath : String;
+    ServerDoc : IServerDocument;
+Begin
+    If SchLib = Nil Then Exit;
+    Workspace := GetWorkspace;
+    If Workspace <> Nil Then
+    Begin
+        Doc := Workspace.DM_FocusedDocument;
+        If Doc <> Nil Then
+        Begin
+            FullPath := '';
+            Try FullPath := Doc.DM_FullPath; Except End;
+            If FullPath <> '' Then
+            Begin
+                ServerDoc := Client.GetDocumentByPath(FullPath);
+                If ServerDoc <> Nil Then
+                    Try ServerDoc.SetModified(True); Except End;
+            End;
+        End;
+    End;
+End;
+
 Function Lib_CreateSymbol(Params : String; RequestId : String) : String;
 Var
     Name, DesignatorPrefix, Description, PartCountStr : String;
@@ -35,10 +111,16 @@ Begin
         Exit;
     End;
 
-    // Create new component
+    // Create new component. Per Altium's createcomp_in_lib.pas reference,
+    // CurrentPartID and DisplayMode must be set BEFORE adding primitives;
+    // primitives carry OwnerPartId/OwnerPartDisplayMode that link them to
+    // a specific part of the component. Without this scaffold, primitives
+    // are added but the lib editor can't display them (symbol shows empty).
     Component := SchServer.SchObjectFactory(eSchComponent, eCreate_Default);
     If Component <> Nil Then
     Begin
+        Component.CurrentPartID := 1;
+        Component.DisplayMode := 0;
         Component.LibReference := Name;
         Component.Designator.Text := DesignatorPrefix + '?';
         Component.ComponentDescription := Description;
@@ -50,10 +132,25 @@ Begin
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
         SchLib.AddSchComponent(Component);
-        SchServer.ProcessControl.PostProcess(SchLib, '');
-        SchLib.CurrentSchComponent := Component;
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
 
-        SaveDocByPath(SchLib.DocumentName);
+        // Broadcast as a new component (source=nil, dest=c_BroadCast). This
+        // is the pattern in Altium's createcomp_in_lib.pas, different from
+        // the per-primitive SchRegisterObject(Container, Obj) which sends
+        // from the container.
+        Try
+            SchServer.RobotManager.SendMessage(
+                Nil, Nil, SCHM_PrimitiveRegistration,
+                Component.I_ObjectAddress);
+        Except End;
+
+        SchLib.CurrentSchComponent := Component;
+        LastCreatedLibComponent := Component;
+
+        // Refresh the library editor view so the new component is visible.
+        Try SchLib.GraphicallyInvalidate; Except End;
+
+        MarkLibDirty(SchLib);
         Result := BuildSuccessResponse(RequestId, '{"success":true,"name":"' + EscapeJsonString(Name) + '","part_count":' + IntToStr(PartCount) + '}');
     End
     Else
@@ -89,7 +186,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -126,11 +223,12 @@ Begin
         Else Pin.Electrical := eElectricPassive;
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
+        SetOwnerPart(Pin, Component);
         Component.AddSchObject(Pin);
         SchRegisterObject(Component, Pin);
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
 
-        SaveDocByPath(SchLib.DocumentName);
+        MarkLibDirty(SchLib);
         Result := BuildSuccessResponse(RequestId, '{"success":true,"designator":"' + EscapeJsonString(Designator) + '","owner_part_id":' + IntToStr(OwnerPartId) + '}');
     End
     Else
@@ -169,7 +267,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -206,11 +304,12 @@ Begin
         Rect.OwnerPartDisplayMode := 0;
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
+        SetOwnerPart(Rect, Component);
         Component.AddSchObject(Rect);
         SchRegisterObject(Component, Rect);
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
 
-        SaveDocByPath(SchLib.DocumentName);
+        MarkLibDirty(SchLib);
         Result := BuildSuccessResponse(RequestId, '{"success":true}');
     End
     Else
@@ -244,7 +343,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -269,11 +368,12 @@ Begin
         Line.OwnerPartDisplayMode := 0;
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
+        SetOwnerPart(Line, Component);
         Component.AddSchObject(Line);
         SchRegisterObject(Component, Line);
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
 
-        SaveDocByPath(SchLib.DocumentName);
+        MarkLibDirty(SchLib);
         Result := BuildSuccessResponse(RequestId, '{"success":true}');
     End
     Else
@@ -367,8 +467,8 @@ Begin
       no PreProcess/PostProcess (those wrap an undo transaction that can
       roll back our changes), per-pad broadcast with target=Pad and
       event=c_NoEventData, then a final component-level broadcast and a
-      ViewManager_FullUpdate. SaveDocByPathNow at the end is our addition
-      for autonomous flow (standalone PcbLibs aren't covered by save_all). }
+      ViewManager_FullUpdate. MarkLibDirty replaces the explicit save —
+      the user flushes with Ctrl+S or save_all when ready. }
     Pad := PCBServer.PCBObjectFactory(ePadObject, eNoDimension, eCreate_Default);
     If Pad <> Nil Then
     Begin
@@ -1019,7 +1119,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -1042,8 +1142,14 @@ Begin
 
     Try
         Impl.ModelName := FootprintName;
-        Impl.ModelType := 'PCBLIB';
+        Impl.ModelType := cDocKind_PcbLib;
         Impl.IsCurrent := True;
+        // NOTE: Tested on Altium 26.5 — Impl.LibraryIdentifier is read-only
+        // and Impl.UseComponentLibrary likewise raises. The library_name
+        // argument is intentionally ignored; use a parent .LibPkg or the
+        // SchLib UI's "Add Footprint → Specified" dialog to attach an
+        // explicit path for the preview pane.
+        SetOwnerPart(Impl, Component);
         Component.AddSchObject(Impl);
         SchRegisterObject(Component, Impl);
     Except
@@ -1084,7 +1190,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -1096,6 +1202,7 @@ Begin
     Begin
         Impl.ModelName := ModelName;
         Impl.ModelType := 'PCB3DModel';
+        SetOwnerPart(Impl, Component);
         Component.AddSchObject(Impl);
         SchRegisterObject(Component, Impl);
 
@@ -1502,13 +1609,21 @@ Var
     Param : ISch_Parameter;
     Workspace : IWorkspace;
     Doc : IDocument;
-    LibPath, Data, CompName, ParamList : String;
+    LibPath, Data, CompName, ParamList, WithParamsStr : String;
     CompNum, I : Integer;
-    First : Boolean;
+    First, WithParams : Boolean;
 Begin
     // Get library path from parameter or active document
     LibPath := ExtractJsonValue(Params, 'library_path');
     LibPath := StringReplace(LibPath, '\\', '\', -1);
+
+    // Optional flag: dump parameters per component. Default is FALSE because
+    // GetState_SchComponentByLibRef + parameter iterator runs O(N) and is the
+    // bottleneck on large libraries (a 400+ component standard lib takes
+    // tens of seconds with parameters on, sub-second without). Callers that
+    // need parameters for a specific symbol should use lib_get_component_details.
+    WithParamsStr := ExtractJsonValue(Params, 'with_parameters');
+    WithParams := (WithParamsStr = 'true') Or (WithParamsStr = 'True') Or (WithParamsStr = '1');
 
     If LibPath = '' Then
     Begin
@@ -1517,7 +1632,14 @@ Begin
         Begin
             Doc := Workspace.DM_FocusedDocument;
             If Doc <> Nil Then
-                LibPath := Doc.DM_FileName;
+            Begin
+                // DM_FileName returns just the basename;
+                // CreateLibCompInfoReader needs the full path or it
+                // silently returns an empty reader (which is exactly the
+                // bug that made lib_get_components always report 0).
+                Try LibPath := Doc.DM_FullPath; Except End;
+                If LibPath = '' Then LibPath := Doc.DM_FileName;
+            End;
         End;
     End;
 
@@ -1527,7 +1649,10 @@ Begin
         Exit;
     End;
 
-    // Use CreateLibCompInfoReader to enumerate components
+    // Use CreateLibCompInfoReader to enumerate components. ICompInfoReader is
+    // a fast metadata reader, it returns CompName, AliasName, PartCount and
+    // Description directly from the lib file without loading every symbol's
+    // primitives, so the cheap path scales linearly with file IO.
     LibReader := SchServer.CreateLibCompInfoReader(LibPath);
     If LibReader = Nil Then
     Begin
@@ -1538,8 +1663,11 @@ Begin
     LibReader.ReadAllComponentInfo;
     CompNum := LibReader.NumComponentInfos;
 
-    // Get SchLib handle to read parameters from each component
-    SchLib := SchServer.GetCurrentSchDocument;
+    // Only navigate to live components when the caller asked for parameters,
+    // otherwise we skip GetState_SchComponentByLibRef entirely.
+    SchLib := Nil;
+    If WithParams Then
+        SchLib := SchServer.GetCurrentSchDocument;
 
     Data := '[';
     First := True;
@@ -1550,29 +1678,35 @@ Begin
         CompInfo := LibReader.ComponentInfos[I];
         CompName := CompInfo.CompName;
 
-        // Read ALL parameters by navigating to the component
-        ParamList := '';
-        If (SchLib <> Nil) And (SchLib.ObjectId = eSchLib) Then
-        Begin
-            Component := SchLib.GetState_SchComponentByLibRef(CompName);
-            If Component <> Nil Then
-            Begin
-                ParamIterator := Component.SchIterator_Create;
-                ParamIterator.AddFilter_ObjectSet(MkSet(eParameter));
-                Param := ParamIterator.FirstSchObject;
-                While Param <> Nil Do
-                Begin
-                    If ParamList <> '' Then ParamList := ParamList + ',';
-                    ParamList := ParamList + '"' + EscapeJsonString(Param.Name) + '":"' + EscapeJsonString(Param.Text) + '"';
-                    Param := ParamIterator.NextSchObject;
-                End;
-                Component.SchIterator_Destroy(ParamIterator);
-            End;
-        End;
-
         Data := Data + '{"name":"' + EscapeJsonString(CompName) + '"';
+        Try Data := Data + ',"alias_name":"' + EscapeJsonString(CompInfo.AliasName) + '"'; Except End;
+        Try Data := Data + ',"part_count":' + IntToStr(CompInfo.PartCount); Except End;
         Data := Data + ',"description":"' + EscapeJsonString(CompInfo.Description) + '"';
-        Data := Data + ',"parameters":{' + ParamList + '}}';
+
+        // Slow path, opt-in via with_parameters=true.
+        If WithParams Then
+        Begin
+            ParamList := '';
+            If (SchLib <> Nil) And (SchLib.ObjectId = eSchLib) Then
+            Begin
+                Component := SchLib.GetState_SchComponentByLibRef(CompName);
+                If Component <> Nil Then
+                Begin
+                    ParamIterator := Component.SchIterator_Create;
+                    ParamIterator.AddFilter_ObjectSet(MkSet(eParameter));
+                    Param := ParamIterator.FirstSchObject;
+                    While Param <> Nil Do
+                    Begin
+                        If ParamList <> '' Then ParamList := ParamList + ',';
+                        ParamList := ParamList + '"' + EscapeJsonString(Param.Name) + '":"' + EscapeJsonString(Param.Text) + '"';
+                        Param := ParamIterator.NextSchObject;
+                    End;
+                    Component.SchIterator_Destroy(ParamIterator);
+                End;
+            End;
+            Data := Data + ',"parameters":{' + ParamList + '}';
+        End;
+        Data := Data + '}';
     End;
 
     SchServer.DestroyCompInfoReader(LibReader);
@@ -1581,83 +1715,513 @@ Begin
     Result := BuildSuccessResponse(RequestId, '{"count":' + IntToStr(CompNum) + ',"components":' + Data + '}');
 End;
 
+{ Lib_Search - case-insensitive substring search over all open SchLib docs. }
+{ The previous implementation invoked Client:FindComponent, which only       }
+{ pops the interactive Find Component panel and returns no data, so the     }
+{ tool was unusable from an LLM. This handler enumerates SchLib members of  }
+{ every workspace project plus the synthetic FreeDocumentsProject (where    }
+{ standalone libraries live), opens an ILibCompInfoReader per file (fast,   }
+{ no live-component load) and matches CompName / Description / AliasName   }
+{ against the query.                                                         }
+{                                                                              }
+{ Params:                                                                     }
+{   query        - substring (case-insensitive). Required.                   }
+{   search_type  - 'all' (default) | 'name' | 'description' | 'parameters'. }
+{                  'all' tests name + description + alias. 'parameters'     }
+{                  also loads each candidate live (slow on big libs).        }
+{   library_path - optional, restrict the search to a single .SchLib file.  }
+{   limit        - max matches (default 100).                                }
+{ Returns a JSON array of {name, alias_name, description, library_path,     }
+{ part_count} per match.                                                     }
+Function SearchOneLibrary(LibPath, Query, SearchType : String;
+    SearchParams : Boolean; SchLib : ISch_Lib;
+    Var ResultsJson : String; Var First : Boolean;
+    Var Count : Integer; Limit : Integer) : Boolean;
+Var
+    LibReader : ILibCompInfoReader;
+    CompInfo : IComponentInfo;
+    Component : ISch_Component;
+    ParamIterator : ISch_Iterator;
+    Param : ISch_Parameter;
+    LowerQuery, CompName, AliasName, Description : String;
+    LowerName, LowerAlias, LowerDesc : String;
+    NumComps, I : Integer;
+    Matched, MatchedParam : Boolean;
+Begin
+    Result := False;
+    LowerQuery := LowerCase(Query);
+
+    LibReader := SchServer.CreateLibCompInfoReader(LibPath);
+    If LibReader = Nil Then Exit;
+
+    Try
+        LibReader.ReadAllComponentInfo;
+        NumComps := LibReader.NumComponentInfos;
+
+        For I := 0 To NumComps - 1 Do
+        Begin
+            If Count >= Limit Then Break;
+
+            CompInfo := LibReader.ComponentInfos[I];
+            CompName := '';
+            AliasName := '';
+            Description := '';
+            Try CompName := CompInfo.CompName; Except End;
+            Try AliasName := CompInfo.AliasName; Except End;
+            Try Description := CompInfo.Description; Except End;
+
+            LowerName := LowerCase(CompName);
+            LowerAlias := LowerCase(AliasName);
+            LowerDesc := LowerCase(Description);
+
+            Matched := False;
+            If SearchType = 'name' Then
+                Matched := Pos(LowerQuery, LowerName) > 0
+            Else If SearchType = 'description' Then
+                Matched := Pos(LowerQuery, LowerDesc) > 0
+            Else
+            Begin
+                { 'all' / 'parameters' both check name + alias + description }
+                { up front. parameters then drops to the slow path on miss. }
+                Matched := (Pos(LowerQuery, LowerName) > 0)
+                    Or (Pos(LowerQuery, LowerAlias) > 0)
+                    Or (Pos(LowerQuery, LowerDesc) > 0);
+            End;
+
+            { Slow path, opt-in only via search_type='parameters'. Loads the }
+            { live component and walks every parameter's name/value, that's }
+            { what makes parameter-search expensive. }
+            If (Not Matched) And SearchParams And (SchLib <> Nil) Then
+            Begin
+                Component := SchLib.GetState_SchComponentByLibRef(CompName);
+                If Component <> Nil Then
+                Begin
+                    MatchedParam := False;
+                    ParamIterator := Component.SchIterator_Create;
+                    ParamIterator.AddFilter_ObjectSet(MkSet(eParameter));
+                    Try
+                        Param := ParamIterator.FirstSchObject;
+                        While (Param <> Nil) And (Not MatchedParam) Do
+                        Begin
+                            If (Pos(LowerQuery, LowerCase(Param.Name)) > 0)
+                                Or (Pos(LowerQuery, LowerCase(Param.Text)) > 0) Then
+                                MatchedParam := True;
+                            Param := ParamIterator.NextSchObject;
+                        End;
+                    Finally
+                        Component.SchIterator_Destroy(ParamIterator);
+                    End;
+                    Matched := MatchedParam;
+                End;
+            End;
+
+            If Matched Then
+            Begin
+                If Not First Then ResultsJson := ResultsJson + ',';
+                First := False;
+                ResultsJson := ResultsJson +
+                    '{"name":"' + EscapeJsonString(CompName) +
+                    '","alias_name":"' + EscapeJsonString(AliasName) +
+                    '","description":"' + EscapeJsonString(Description) +
+                    '","library_path":"' + EscapeJsonString(LibPath) +
+                    '","part_count":' + IntToStr(CompInfo.PartCount) + '}';
+                Inc(Count);
+            End;
+        End;
+    Finally
+        SchServer.DestroyCompInfoReader(LibReader);
+    End;
+
+    Result := True;
+End;
+
 Function Lib_Search(Params : String; RequestId : String) : String;
 Var
-    Query : String;
+    Query, SearchType, LibPathFilter : String;
+    Workspace : IWorkspace;
+    Project : IProject;
+    Doc : IDocument;
+    FocusedSchLib : ISch_Lib;
+    DocPath, ResultsJson : String;
+    I, J, Count, Limit : Integer;
+    First, IsLib, SearchParams : Boolean;
 Begin
     Query := ExtractJsonValue(Params, 'query');
+    SearchType := ExtractJsonValue(Params, 'search_type');
+    LibPathFilter := ExtractJsonValue(Params, 'library_path');
+    LibPathFilter := StringReplace(LibPathFilter, '\\', '\', -1);
+    Limit := StrToIntDef(ExtractJsonValue(Params, 'limit'), 100);
 
-    // Use the built-in library search process
-    ResetParameters;
-    AddStringParameter('Query', Query);
-    RunProcess('Client:FindComponent');
+    If SearchType = '' Then SearchType := 'all';
+    SearchParams := SearchType = 'parameters';
 
-    Result := BuildSuccessResponse(RequestId, '{"success":true,"query":"' + EscapeJsonString(Query) + '"}');
+    If Query = '' Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'MISSING_PARAMS', 'query is required');
+        Exit;
+    End;
+
+    Workspace := GetWorkspace;
+    If Workspace = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_WORKSPACE', 'No workspace');
+        Exit;
+    End;
+
+    { Parameter searches need the live component, which only the focused }
+    { library exposes. Cache the focused SchLib so SearchOneLibrary can  }
+    { pass it through without re-resolving on every match attempt.       }
+    FocusedSchLib := Nil;
+    If SearchParams Then
+    Begin
+        Try
+            If (SchServer.GetCurrentSchDocument <> Nil)
+                And (SchServer.GetCurrentSchDocument.ObjectId = eSchLib) Then
+                FocusedSchLib := SchServer.GetCurrentSchDocument;
+        Except End;
+    End;
+
+    ResultsJson := '';
+    First := True;
+    Count := 0;
+
+    { Single-library mode short-circuits the workspace walk. }
+    If LibPathFilter <> '' Then
+        SearchOneLibrary(LibPathFilter, Query, SearchType, SearchParams,
+            FocusedSchLib, ResultsJson, First, Count, Limit)
+    Else
+    Begin
+        For I := 0 To Workspace.DM_ProjectCount - 1 Do
+        Begin
+            If Count >= Limit Then Break;
+            Project := Workspace.DM_Projects(I);
+            If Project = Nil Then Continue;
+            For J := 0 To Project.DM_LogicalDocumentCount - 1 Do
+            Begin
+                If Count >= Limit Then Break;
+                Doc := Project.DM_LogicalDocuments(J);
+                If Doc = Nil Then Continue;
+                IsLib := False;
+                Try
+                    DocPath := Doc.DM_FullPath;
+                    IsLib := (UpperCase(Doc.DM_DocumentKind) = 'SCHLIB')
+                        Or (Pos('.SCHLIB', UpperCase(DocPath)) > 0);
+                Except End;
+                If Not IsLib Then Continue;
+                SearchOneLibrary(DocPath, Query, SearchType, SearchParams,
+                    FocusedSchLib, ResultsJson, First, Count, Limit);
+            End;
+        End;
+
+        { Free documents (libraries opened standalone, not in any project) }
+        Try
+            Project := Workspace.DM_FreeDocumentsProject;
+            If Project <> Nil Then
+            Begin
+                For J := 0 To Project.DM_LogicalDocumentCount - 1 Do
+                Begin
+                    If Count >= Limit Then Break;
+                    Doc := Project.DM_LogicalDocuments(J);
+                    If Doc = Nil Then Continue;
+                    IsLib := False;
+                    Try
+                        DocPath := Doc.DM_FullPath;
+                        IsLib := (UpperCase(Doc.DM_DocumentKind) = 'SCHLIB')
+                            Or (Pos('.SCHLIB', UpperCase(DocPath)) > 0);
+                    Except End;
+                    If Not IsLib Then Continue;
+                    SearchOneLibrary(DocPath, Query, SearchType, SearchParams,
+                        FocusedSchLib, ResultsJson, First, Count, Limit);
+                End;
+            End;
+        Except End;
+    End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"query":"' + EscapeJsonString(Query) +
+        '","search_type":"' + EscapeJsonString(SearchType) +
+        '","count":' + IntToStr(Count) +
+        ',"limit":' + IntToStr(Limit) +
+        ',"truncated":' + BoolToJsonStr(Count >= Limit) +
+        ',"results":[' + ResultsJson + ']}');
+End;
+
+{ Lib_GetComponentDetails - full inspection of one library component.        }
+{ Returns metadata (name, description, part_count, alias_name) PLUS pins,    }
+{ parameters, and full visual-style records for the designator, the comment, }
+{ and every parameter (font_id, color, is_hidden, x, y, orientation,        }
+{ justification). FontId can be expanded into a {name, size, bold, italic}  }
+{ description by calling get_font_spec; we pass it through as an integer    }
+{ here so the cost stays on the caller when style detail isn't needed.       }
+{                                                                              }
+{ Pins/parameters require loading the live ISch_Component, which only the    }
+{ SchLib editor can produce, so the target library must be the focused       }
+{ SchServer document. If the caller passed a library_path that doesn't       }
+{ match the focused doc, we open it via WorkspaceManager:OpenObject before   }
+{ resolving. Saves are deferred (see MarkLibDirty), so opening doesn't       }
+{ disturb in-flight edits on other libs.                                     }
+{                                                                              }
+{ Schema breaks vs the previous version (introduced two commits ago):        }
+{   designator_prefix (str) -> designator (object {text, font_id, color,    }
+{                              is_hidden, x, y, orientation, justification})}
+{   pins[].font_id, color, label_hidden added                                }
+{   comment (object) added                                                   }
+{   parameter_styles (array, parallel to parameters dict) added              }
+
+{ BuildLabelStyleJson reads visual-style props off any ISch_Label-derived    }
+{ object (Designator, Comment, Parameter, NetLabel, ...) using late-bound   }
+{ accessors. Each access is wrapped in Try/Except since not every property  }
+{ is present on every ISch_Label subtype, and DelphiScript fails at runtime }
+{ rather than compile time on a missing late-bound property.                 }
+Function BuildLabelStyleJson(Lbl : ISch_Label; IncludeText : Boolean) : String;
+Var
+    Txt : String;
+    FontId, ColorVal, OrientVal, JustVal, LocX, LocY : Integer;
+    HiddenVal : Boolean;
+Begin
+    Txt := '';
+    FontId := 0;
+    ColorVal := 0;
+    OrientVal := 0;
+    JustVal := 0;
+    LocX := 0;
+    LocY := 0;
+    HiddenVal := False;
+    Try Txt := Lbl.Text; Except End;
+    Try FontId := Lbl.FontId; Except End;
+    Try ColorVal := Lbl.Color; Except End;
+    Try HiddenVal := Lbl.IsHidden; Except End;
+    Try LocX := CoordToMils(Lbl.Location.X); Except End;
+    Try LocY := CoordToMils(Lbl.Location.Y); Except End;
+    Try OrientVal := Lbl.Orientation; Except End;
+    Try JustVal := Lbl.Justification; Except End;
+
+    Result := '{';
+    If IncludeText Then
+        Result := Result + '"text":"' + EscapeJsonString(Txt) + '",';
+    Result := Result +
+        '"font_id":' + IntToStr(FontId) +
+        ',"color":' + IntToStr(ColorVal) +
+        ',"is_hidden":' + BoolToJsonStr(HiddenVal) +
+        ',"x":' + IntToStr(LocX) +
+        ',"y":' + IntToStr(LocY) +
+        ',"orientation":' + IntToStr(OrientVal) +
+        ',"justification":' + IntToStr(JustVal) + '}';
 End;
 
 Function Lib_GetComponentDetails(Params : String; RequestId : String) : String;
 Var
-    ComponentName, LibPath : String;
+    ComponentName, LibPath, FocusedPath : String;
     LibReader : ILibCompInfoReader;
     CompInfo : IComponentInfo;
     Workspace : IWorkspace;
     Doc : IDocument;
-    CompNum, I : Integer;
-    Data : String;
-    Found : Boolean;
+    SchLib : ISch_Lib;
+    Component : ISch_Component;
+    PinIterator, ParamIterator : ISch_Iterator;
+    Pin : ISch_Pin;
+    Param : ISch_Parameter;
+    CompNum, I, PinCount : Integer;
+    Data, PinList, ParamList, StyleList, ElecStr : String;
+    DesignatorJson, CommentJson, Description, AliasName : String;
+    PartCount : Integer;
+    PinLabelHidden : Boolean;
+    First, FirstStyle, FoundInfo : Boolean;
 Begin
     ComponentName := ExtractJsonValue(Params, 'component_name');
+    LibPath := ExtractJsonValue(Params, 'library_path');
+    LibPath := StringReplace(LibPath, '\\', '\', -1);
 
-    // Get library path from active document
-    LibPath := '';
-    Workspace := GetWorkspace;
-    If Workspace <> Nil Then
+    If ComponentName = '' Then
     Begin
-        Doc := Workspace.DM_FocusedDocument;
-        If Doc <> Nil Then
-            LibPath := Doc.DM_FileName;
+        Result := BuildErrorResponse(RequestId, 'MISSING_PARAMS', 'component_name is required');
+        Exit;
     End;
+
+    Workspace := GetWorkspace;
+    If Workspace = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_WORKSPACE', 'No workspace');
+        Exit;
+    End;
+
+    { Resolve the focused doc's path so we know whether to reopen. }
+    FocusedPath := '';
+    Doc := Workspace.DM_FocusedDocument;
+    If Doc <> Nil Then
+        Try FocusedPath := Doc.DM_FullPath; Except End;
+
+    If LibPath = '' Then
+        LibPath := FocusedPath;
 
     If LibPath = '' Then
     Begin
-        Result := BuildErrorResponse(RequestId, 'NO_LIBRARY', 'No library document is active');
+        Result := BuildErrorResponse(RequestId, 'NO_LIBRARY',
+            'No library document is active and no library_path was supplied');
         Exit;
     End;
 
+    { Bring the requested library into focus when it isn't already. }
+    If (FocusedPath = '') Or (UpperCase(FocusedPath) <> UpperCase(LibPath)) Then
+    Begin
+        ResetParameters;
+        AddStringParameter('ObjectKind', 'Document');
+        AddStringParameter('FileName', LibPath);
+        RunProcess('WorkspaceManager:OpenObject');
+    End;
+
+    SchLib := SchServer.GetCurrentSchDocument;
+    If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_SCHLIB',
+            'Failed to focus library at ' + LibPath);
+        Exit;
+    End;
+
+    { Cheap metadata lookup via CompInfoReader: the live component carries }
+    { LibReference / ComponentDescription too, but PartCount is on the    }
+    { reader's IComponentInfo and not on ISch_Component, so we fetch it   }
+    { here. }
+    Description := '';
+    AliasName := '';
+    PartCount := 1;
+    FoundInfo := False;
     LibReader := SchServer.CreateLibCompInfoReader(LibPath);
-    If LibReader = Nil Then
+    If LibReader <> Nil Then
     Begin
-        Result := BuildErrorResponse(RequestId, 'READER_FAILED', 'Failed to create library reader');
-        Exit;
-    End;
-
-    LibReader.ReadAllComponentInfo;
-    CompNum := LibReader.NumComponentInfos;
-
-    // Find the component by name
-    Found := False;
-    For I := 0 To CompNum - 1 Do
-    Begin
-        CompInfo := LibReader.ComponentInfos[I];
-        If CompInfo.CompName = ComponentName Then
-        Begin
-            Found := True;
-            Break;
+        Try
+            LibReader.ReadAllComponentInfo;
+            CompNum := LibReader.NumComponentInfos;
+            For I := 0 To CompNum - 1 Do
+            Begin
+                CompInfo := LibReader.ComponentInfos[I];
+                If CompInfo.CompName = ComponentName Then
+                Begin
+                    Try Description := CompInfo.Description; Except End;
+                    Try AliasName := CompInfo.AliasName; Except End;
+                    Try PartCount := CompInfo.PartCount; Except End;
+                    FoundInfo := True;
+                    Break;
+                End;
+            End;
+        Finally
+            SchServer.DestroyCompInfoReader(LibReader);
         End;
     End;
 
-    If Not Found Then
+    Component := SchLib.GetState_SchComponentByLibRef(ComponentName);
+    If Component = Nil Then
     Begin
-        SchServer.DestroyCompInfoReader(LibReader);
-        Result := BuildErrorResponse(RequestId, 'COMPONENT_NOT_FOUND', 'Component not found: ' + ComponentName);
+        Result := BuildErrorResponse(RequestId, 'COMPONENT_NOT_FOUND',
+            'Component not found in library: ' + ComponentName);
         Exit;
     End;
 
-    Data := '{"name":"' + EscapeJsonString(CompInfo.CompName) + '"';
-    Data := Data + ',"description":"' + EscapeJsonString(CompInfo.Description) + '"';
-    Data := Data + ',"part_count":' + IntToStr(CompInfo.PartCount) + '}';
+    If Description = '' Then
+        Try Description := Component.ComponentDescription; Except End;
 
-    SchServer.DestroyCompInfoReader(LibReader);
+    { Designator + Comment full-style records. The sub-objects ARE        }
+    { ISch_Label-derived so they expose Text + FontId + Color + IsHidden  }
+    { + Location + Orientation + Justification.                            }
+    DesignatorJson := '{"text":"","font_id":0,"color":0,"is_hidden":false,"x":0,"y":0,"orientation":0,"justification":0}';
+    Try DesignatorJson := BuildLabelStyleJson(Component.Designator, True); Except End;
+    CommentJson := '{"text":"","font_id":0,"color":0,"is_hidden":false,"x":0,"y":0,"orientation":0,"justification":0}';
+    Try CommentJson := BuildLabelStyleJson(Component.Comment, True); Except End;
+
+    { Pin list. font_id / color come from each pin's own ISch_Pin object  }
+    { (it inherits from ISch_GraphicalObject which carries both); pin     }
+    { name and pin number share that font/color, separate-font handling   }
+    { is not exposed cleanly from DelphiScript. label_hidden is the visual}
+    { hide-pin-label flag, distinct from pin.IsHidden which hides the pin }
+    { from the canvas entirely.                                            }
+    PinList := '';
+    First := True;
+    PinCount := 0;
+    PinIterator := Component.SchIterator_Create;
+    PinIterator.AddFilter_ObjectSet(MkSet(ePin));
+    Try
+        Pin := PinIterator.FirstSchObject;
+        While Pin <> Nil Do
+        Begin
+            If Not First Then PinList := PinList + ',';
+            First := False;
+
+            If Pin.Electrical = eElectricInput Then ElecStr := 'input'
+            Else If Pin.Electrical = eElectricOutput Then ElecStr := 'output'
+            Else If Pin.Electrical = eElectricIO Then ElecStr := 'bidirectional'
+            Else If Pin.Electrical = eElectricPassive Then ElecStr := 'passive'
+            Else If Pin.Electrical = eElectricPower Then ElecStr := 'power'
+            Else If Pin.Electrical = eElectricOpenCollector Then ElecStr := 'open_collector'
+            Else If Pin.Electrical = eElectricOpenEmitter Then ElecStr := 'open_emitter'
+            Else If Pin.Electrical = eElectricHiZ Then ElecStr := 'hiz'
+            Else ElecStr := 'passive';
+
+            { Pin label visibility: ISch_Pin.ShowName / ShowDesignator are }
+            { the real flags; combine into a single label_hidden when both }
+            { are off so the LLM can flag "neither pin name nor number is }
+            { drawn". font_id / color are NOT exposed on ISch_Pin in the   }
+            { Schematic API at all (only on the ISch_Label family), so we }
+            { intentionally omit them from pins[] rather than fake zeros. }
+            PinLabelHidden := False;
+            Try PinLabelHidden := (Not Pin.ShowName) And (Not Pin.ShowDesignator); Except End;
+
+            PinList := PinList + '{"designator":"' + EscapeJsonString(Pin.Designator) +
+                '","name":"' + EscapeJsonString(Pin.Name) +
+                '","electrical_type":"' + ElecStr +
+                '","x":' + IntToStr(CoordToMils(Pin.Location.X)) +
+                ',"y":' + IntToStr(CoordToMils(Pin.Location.Y)) +
+                ',"orientation":' + IntToStr(Pin.Orientation) +
+                ',"hidden":' + BoolToJsonStr(Pin.IsHidden) +
+                ',"label_hidden":' + BoolToJsonStr(PinLabelHidden) + '}';
+            Inc(PinCount);
+
+            Pin := PinIterator.NextSchObject;
+        End;
+    Finally
+        Component.SchIterator_Destroy(PinIterator);
+    End;
+
+    { Parameter dict (cheap lookups) plus parameter_styles array (visual). }
+    { We iterate parameters once and build both shapes in lockstep so the  }
+    { kth entry of parameter_styles always matches the kth iteration order.}
+    ParamList := '';
+    StyleList := '';
+    First := True;
+    FirstStyle := True;
+    ParamIterator := Component.SchIterator_Create;
+    ParamIterator.AddFilter_ObjectSet(MkSet(eParameter));
+    Try
+        Param := ParamIterator.FirstSchObject;
+        While Param <> Nil Do
+        Begin
+            If Not First Then ParamList := ParamList + ',';
+            First := False;
+            ParamList := ParamList + '"' + EscapeJsonString(Param.Name) +
+                '":"' + EscapeJsonString(Param.Text) + '"';
+
+            If Not FirstStyle Then StyleList := StyleList + ',';
+            FirstStyle := False;
+            StyleList := StyleList + '{"name":"' + EscapeJsonString(Param.Name) +
+                '","value":"' + EscapeJsonString(Param.Text) + '","style":' +
+                BuildLabelStyleJson(Param, False) + '}';
+
+            Param := ParamIterator.NextSchObject;
+        End;
+    Finally
+        Component.SchIterator_Destroy(ParamIterator);
+    End;
+
+    Data := '{"name":"' + EscapeJsonString(ComponentName) + '"';
+    Data := Data + ',"library_path":"' + EscapeJsonString(LibPath) + '"';
+    Data := Data + ',"designator":' + DesignatorJson;
+    Data := Data + ',"comment":' + CommentJson;
+    Data := Data + ',"description":"' + EscapeJsonString(Description) + '"';
+    Data := Data + ',"alias_name":"' + EscapeJsonString(AliasName) + '"';
+    Data := Data + ',"part_count":' + IntToStr(PartCount);
+    Data := Data + ',"pin_count":' + IntToStr(PinCount);
+    Data := Data + ',"pins":[' + PinList + ']';
+    Data := Data + ',"parameters":{' + ParamList + '}';
+    Data := Data + ',"parameter_styles":[' + StyleList + ']}';
 
     Result := BuildSuccessResponse(RequestId, Data);
 End;
@@ -1801,6 +2365,7 @@ Begin
                     Begin
                         NewParam.Name := ParamName;
                         NewParam.Text := ParamValue;
+                        SetOwnerPart(NewParam, Component);
                         Component.AddSchObject(NewParam);
                         SchRegisterObject(Component, NewParam);
                         Inc(Created);
@@ -1814,10 +2379,10 @@ Begin
         End;
     Finally
         // End modification block - commit changes
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
     End;
 
-    SaveDocByPath(SchLib.DocumentName);
+    MarkLibDirty(SchLib);
     Result := BuildSuccessResponse(RequestId,
         '{"updated":' + IntToStr(Updated) +
         ',"created":' + IntToStr(Created) +
@@ -1869,7 +2434,7 @@ Begin
             Client.ShowDocument(ServerDoc)
         Else
         Begin
-            // Not yet open — open it
+            // Not yet open, open it
             ResetParameters;
             AddStringParameter('ObjectKind', 'Document');
             AddStringParameter('FileName', LibPath);
@@ -1935,11 +2500,11 @@ Begin
         End;
     Finally
         // End modification block - commit changes
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
     End;
 
     SchLib.GraphicallyInvalidate;
-    SaveDocByPath(SchLib.DocumentName);
+    MarkLibDirty(SchLib);
 
     Result := BuildSuccessResponse(RequestId,
         '{"renamed":' + IntToStr(Renamed) +
@@ -1948,7 +2513,7 @@ Begin
 End;
 
 {..............................................................................}
-{ Diff two SchLib files — reports components only in A, only in B, or both   }
+{ Diff two SchLib files, reports components only in A, only in B, or both   }
 {..............................................................................}
 
 Function Lib_DiffLibraries(Params : String; RequestId : String) : String;
@@ -2071,7 +2636,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -2091,11 +2656,12 @@ Begin
         Arc.OwnerPartDisplayMode := 0;
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
+        SetOwnerPart(Arc, Component);
         Component.AddSchObject(Arc);
         SchRegisterObject(Component, Arc);
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
 
-        SaveDocByPath(SchLib.DocumentName);
+        MarkLibDirty(SchLib);
         Result := BuildSuccessResponse(RequestId, '{"success":true}');
     End
     Else
@@ -2136,7 +2702,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -2197,11 +2763,12 @@ Begin
             Polygon.Vertex[I] := Point(MilsToCoord(XValues[I-1]), MilsToCoord(YValues[I-1]));
 
         SchServer.ProcessControl.PreProcess(SchLib, '');
+        SetOwnerPart(Polygon, Component);
         Component.AddSchObject(Polygon);
         SchRegisterObject(Component, Polygon);
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
 
-        SaveDocByPath(SchLib.DocumentName);
+        MarkLibDirty(SchLib);
         Result := BuildSuccessResponse(RequestId,
             '{"success":true,"vertices":' + IntToStr(VertexCount) + '}');
     End
@@ -2247,9 +2814,9 @@ Begin
     SchBeginModify(Component);
     Component.ComponentDescription := Description;
     SchEndModify(Component);
-    SchServer.ProcessControl.PostProcess(SchLib, '');
+    SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
 
-    SaveDocByPath(SchLib.DocumentName);
+    MarkLibDirty(SchLib);
     Result := BuildSuccessResponse(RequestId,
         '{"success":true,"component":"' + EscapeJsonString(CompName) +
         '","description":"' + EscapeJsonString(Description) + '"}');
@@ -2277,7 +2844,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -2387,11 +2954,11 @@ Begin
 
     SchServer.ProcessControl.PreProcess(SchLib, '');
     SchLib.AddSchComponent(NewComp);
-    SchServer.ProcessControl.PostProcess(SchLib, '');
+    SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
 
     SchLib.CurrentSchComponent := NewComp;
 
-    SaveDocByPath(SchLib.DocumentName);
+    MarkLibDirty(SchLib);
     Result := BuildSuccessResponse(RequestId,
         '{"success":true,"source":"' + EscapeJsonString(SourceName) +
         '","new_name":"' + EscapeJsonString(NewName) + '"}');
@@ -2436,7 +3003,7 @@ Begin
         Exit;
     End;
 
-    Component := SchLib.CurrentSchComponent;
+    Component := GetTargetLibComponent(SchLib);
     If Component = Nil Then
     Begin
         Result := BuildErrorResponse(RequestId, 'NO_COMPONENT', 'No component is selected');
@@ -2477,7 +3044,7 @@ Begin
 
             Pin.Designator := Designator;
             Pin.Name := Name;
-            { Location is a by-value record — read, mutate, write back.         }
+            { Location is a by-value record, read, mutate, write back.         }
             Loc := Pin.Location;
             Loc.X := MilsToCoord(X);
             Loc.Y := MilsToCoord(Y);
@@ -2499,19 +3066,586 @@ Begin
             Else If ElecType = 'hiz' Then Pin.Electrical := eElectricHiZ
             Else Pin.Electrical := eElectricPassive;
 
+            SetOwnerPart(Pin, Component);
+
             Component.AddSchObject(Pin);
             SchRegisterObject(Component, Pin);
             Inc(Added);
         End;
     Finally
-        SchServer.ProcessControl.PostProcess(SchLib, '');
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
     End;
 
-    SaveDocByPath(SchLib.DocumentName);
+    MarkLibDirty(SchLib);
 
     Result := BuildSuccessResponse(RequestId,
         '{"added":' + IntToStr(Added) + ',"failed":' + IntToStr(Failed)
         + ',"total":' + IntToStr(OpCount) + '}');
+End;
+
+{..............................................................................}
+{ Lib_AuditStyles - bulk visual-style audit across every component in a       }
+{ library. Walks SchLib.SchIterator with eSchComponent filter (live           }
+{ components, no per-name GetState_SchComponentByLibRef lookup), and emits    }
+{ the designator's full style record per component. Comment / parameter_     }
+{ styles / pins are opt-in via flags so the default response stays compact.  }
+{                                                                              }
+{ Filter mode: when expect_designator_font_id and/or expect_designator_color }
+{ are supplied, only components whose designator does NOT match the expected }
+{ value go in the output. Without filters, every component is returned.       }
+{                                                                              }
+{ Params:                                                                     }
+{   library_path                  - .SchLib path. Defaults to focused doc.   }
+{   with_comment=true             - include comment style record per comp.  }
+{   with_parameters=true          - include parameter_styles array per comp.}
+{   with_pins=true                - include pins array per comp.             }
+{   expect_designator_font_id=N   - filter: trim matches.                    }
+{   expect_designator_color=N     - filter: trim matches.                    }
+{   limit=5000                    - cap on emitted entries.                  }
+{                                                                              }
+{ Returns: {library_path, count, mismatch_count, limit, truncated,           }
+{          filter_applied, components:[...]}.                                 }
+Function Lib_AuditStyles(Params : String; RequestId : String) : String;
+Var
+    LibPath, FocusedPath, FlagStr : String;
+    ExpFontIdStr, ExpColorStr : String;
+    HasExpFontId, HasExpColor, FilterApplied : Boolean;
+    WithComment, WithParameters, WithPins : Boolean;
+    ExpFontId, ExpColor : Integer;
+    Workspace : IWorkspace;
+    Doc : IDocument;
+    SchLib : ISch_Lib;
+    LibReader : ILibCompInfoReader;
+    CompInfo : IComponentInfo;
+    PinIter, ParamIter : ISch_Iterator;
+    Component : ISch_Component;
+    Pin : ISch_Pin;
+    Param : ISch_Parameter;
+    DesigLabel : ISch_Label;
+    Limit, Count, MismatchCount, PinCount, NumComps, I : Integer;
+    DesigFontId, DesigColor : Integer;
+    DesigJson, CommentJson, PinList, StyleList, ElecStr, ResultsJson, Entry, CompName : String;
+    PinLabelHidden : Boolean;
+    First, FirstPin, FirstStyle, Mismatched : Boolean;
+Begin
+    LibPath := ExtractJsonValue(Params, 'library_path');
+    LibPath := StringReplace(LibPath, '\\', '\', -1);
+
+    FlagStr := ExtractJsonValue(Params, 'with_comment');
+    WithComment := (FlagStr = 'true') Or (FlagStr = 'True') Or (FlagStr = '1');
+    FlagStr := ExtractJsonValue(Params, 'with_parameters');
+    WithParameters := (FlagStr = 'true') Or (FlagStr = 'True') Or (FlagStr = '1');
+    FlagStr := ExtractJsonValue(Params, 'with_pins');
+    WithPins := (FlagStr = 'true') Or (FlagStr = 'True') Or (FlagStr = '1');
+
+    Limit := StrToIntDef(ExtractJsonValue(Params, 'limit'), 5000);
+
+    ExpFontIdStr := ExtractJsonValue(Params, 'expect_designator_font_id');
+    ExpColorStr := ExtractJsonValue(Params, 'expect_designator_color');
+    HasExpFontId := ExpFontIdStr <> '';
+    HasExpColor := ExpColorStr <> '';
+    ExpFontId := StrToIntDef(ExpFontIdStr, 0);
+    ExpColor := StrToIntDef(ExpColorStr, 0);
+    FilterApplied := HasExpFontId Or HasExpColor;
+
+    Workspace := GetWorkspace;
+    If Workspace = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_WORKSPACE', 'No workspace');
+        Exit;
+    End;
+
+    FocusedPath := '';
+    Doc := Workspace.DM_FocusedDocument;
+    If Doc <> Nil Then
+        Try FocusedPath := Doc.DM_FullPath; Except End;
+
+    If LibPath = '' Then LibPath := FocusedPath;
+    If LibPath = '' Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_LIBRARY',
+            'No library document is active and no library_path was supplied');
+        Exit;
+    End;
+
+    If (FocusedPath = '') Or (UpperCase(FocusedPath) <> UpperCase(LibPath)) Then
+    Begin
+        ResetParameters;
+        AddStringParameter('ObjectKind', 'Document');
+        AddStringParameter('FileName', LibPath);
+        RunProcess('WorkspaceManager:OpenObject');
+    End;
+
+    SchLib := SchServer.GetCurrentSchDocument;
+    If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_SCHLIB',
+            'Failed to focus library at ' + LibPath);
+        Exit;
+    End;
+
+    Count := 0;
+    MismatchCount := 0;
+    ResultsJson := '';
+    First := True;
+
+    { Enumerate via ILibCompInfoReader. The schematic SchIterator with        }
+    { eSchComponent only walks components placed on a regular SchDoc, NOT    }
+    { the symbol entries inside a SchLib. The CompInfoReader gives names    }
+    { in document order; for each name we load the live ISch_Component via }
+    { GetState_SchComponentByLibRef to read its designator/comment/parameter}
+    { style records. This is the same pattern Lib_GetComponents uses.        }
+    LibReader := SchServer.CreateLibCompInfoReader(LibPath);
+    If LibReader = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'READER_FAILED',
+            'Failed to create library reader for ' + LibPath);
+        Exit;
+    End;
+
+    Try
+        LibReader.ReadAllComponentInfo;
+        NumComps := LibReader.NumComponentInfos;
+
+        For I := 0 To NumComps - 1 Do
+        Begin
+            If Count >= Limit Then Break;
+
+            CompInfo := LibReader.ComponentInfos[I];
+            CompName := '';
+            Try CompName := CompInfo.CompName; Except End;
+            If CompName = '' Then Continue;
+
+            Component := SchLib.GetState_SchComponentByLibRef(CompName);
+            If Component = Nil Then Continue;
+
+            { Read designator font_id / color via the typed ISch_Label local. }
+            { Component.Designator returns ISch_Designator which IS an        }
+            { ISch_Label, so the assignment + late-bound property reads       }
+            { resolve cleanly at compile time.                                  }
+            DesigLabel := Nil;
+            DesigFontId := 0;
+            DesigColor := 0;
+            Try DesigLabel := Component.Designator; Except End;
+            If DesigLabel <> Nil Then
+            Begin
+                Try DesigFontId := DesigLabel.FontId; Except End;
+                Try DesigColor := DesigLabel.Color; Except End;
+            End;
+
+            Mismatched := False;
+            If HasExpFontId And (DesigFontId <> ExpFontId) Then Mismatched := True;
+            If HasExpColor And (DesigColor <> ExpColor) Then Mismatched := True;
+
+            { Skip when filter is on and the component matches the expected }
+            { style. Without filters, every component is emitted.            }
+            If (Not FilterApplied) Or Mismatched Then
+            Begin
+
+                DesigJson := '{"text":"","font_id":0,"color":0,"is_hidden":false,"x":0,"y":0,"orientation":0,"justification":0}';
+                If DesigLabel <> Nil Then
+                    Try DesigJson := BuildLabelStyleJson(DesigLabel, True); Except End;
+
+                Entry := '{"name":"' + EscapeJsonString(CompName) +
+                    '","designator":' + DesigJson +
+                    ',"mismatched":' + BoolToJsonStr(Mismatched);
+
+                If WithComment Then
+                Begin
+                    CommentJson := '{"text":"","font_id":0,"color":0,"is_hidden":false,"x":0,"y":0,"orientation":0,"justification":0}';
+                    Try CommentJson := BuildLabelStyleJson(Component.Comment, True); Except End;
+                    Entry := Entry + ',"comment":' + CommentJson;
+                End;
+
+                If WithPins Then
+                Begin
+                    PinList := '';
+                    FirstPin := True;
+                    PinCount := 0;
+                    PinIter := Component.SchIterator_Create;
+                    PinIter.AddFilter_ObjectSet(MkSet(ePin));
+                    Try
+                        Pin := PinIter.FirstSchObject;
+                        While Pin <> Nil Do
+                        Begin
+                            If Not FirstPin Then PinList := PinList + ',';
+                            FirstPin := False;
+
+                            If Pin.Electrical = eElectricInput Then ElecStr := 'input'
+                            Else If Pin.Electrical = eElectricOutput Then ElecStr := 'output'
+                            Else If Pin.Electrical = eElectricIO Then ElecStr := 'bidirectional'
+                            Else If Pin.Electrical = eElectricPassive Then ElecStr := 'passive'
+                            Else If Pin.Electrical = eElectricPower Then ElecStr := 'power'
+                            Else If Pin.Electrical = eElectricOpenCollector Then ElecStr := 'open_collector'
+                            Else If Pin.Electrical = eElectricOpenEmitter Then ElecStr := 'open_emitter'
+                            Else If Pin.Electrical = eElectricHiZ Then ElecStr := 'hiz'
+                            Else ElecStr := 'passive';
+
+                            PinLabelHidden := False;
+                            Try PinLabelHidden := (Not Pin.ShowName) And (Not Pin.ShowDesignator); Except End;
+
+                            PinList := PinList + '{"designator":"' + EscapeJsonString(Pin.Designator) +
+                                '","name":"' + EscapeJsonString(Pin.Name) +
+                                '","electrical_type":"' + ElecStr +
+                                '","x":' + IntToStr(CoordToMils(Pin.Location.X)) +
+                                ',"y":' + IntToStr(CoordToMils(Pin.Location.Y)) +
+                                ',"orientation":' + IntToStr(Pin.Orientation) +
+                                ',"hidden":' + BoolToJsonStr(Pin.IsHidden) +
+                                ',"label_hidden":' + BoolToJsonStr(PinLabelHidden) + '}';
+                            Inc(PinCount);
+
+                            Pin := PinIter.NextSchObject;
+                        End;
+                    Finally
+                        Component.SchIterator_Destroy(PinIter);
+                    End;
+                    Entry := Entry + ',"pin_count":' + IntToStr(PinCount) +
+                        ',"pins":[' + PinList + ']';
+                End;
+
+                If WithParameters Then
+                Begin
+                    StyleList := '';
+                    FirstStyle := True;
+                    ParamIter := Component.SchIterator_Create;
+                    ParamIter.AddFilter_ObjectSet(MkSet(eParameter));
+                    Try
+                        Param := ParamIter.FirstSchObject;
+                        While Param <> Nil Do
+                        Begin
+                            If Not FirstStyle Then StyleList := StyleList + ',';
+                            FirstStyle := False;
+                            StyleList := StyleList + '{"name":"' + EscapeJsonString(Param.Name) +
+                                '","value":"' + EscapeJsonString(Param.Text) +
+                                '","style":' + BuildLabelStyleJson(Param, False) + '}';
+                            Param := ParamIter.NextSchObject;
+                        End;
+                    Finally
+                        Component.SchIterator_Destroy(ParamIter);
+                    End;
+                    Entry := Entry + ',"parameter_styles":[' + StyleList + ']';
+                End;
+
+                Entry := Entry + '}';
+
+                If Not First Then ResultsJson := ResultsJson + ',';
+                First := False;
+                ResultsJson := ResultsJson + Entry;
+
+                If Mismatched Then Inc(MismatchCount);
+                Inc(Count);
+            End;
+        End;
+    Finally
+        SchServer.DestroyCompInfoReader(LibReader);
+    End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"library_path":"' + EscapeJsonString(LibPath) + '"' +
+        ',"count":' + IntToStr(Count) +
+        ',"mismatch_count":' + IntToStr(MismatchCount) +
+        ',"limit":' + IntToStr(Limit) +
+        ',"truncated":' + BoolToJsonStr(Count >= Limit) +
+        ',"filter_applied":' + BoolToJsonStr(FilterApplied) +
+        ',"components":[' + ResultsJson + ']}');
+End;
+
+{..............................................................................}
+{ Lib_SetLabelFormat - bulk OR single-component label-style writer.            }
+{                                                                              }
+{ Sets any subset of {font_id, color, is_hidden, orientation, justification}  }
+{ on a target ISch_Label (designator, comment, or one named parameter) for    }
+{ either one component (component_name supplied) or every component in the   }
+{ library (component_name omitted). Symmetric counterpart to                  }
+{ lib_audit_styles' filtering: when only_mismatched is true (default), the   }
+{ handler skips components whose target label already matches every          }
+{ specified field, so re-runs after partial application stay idempotent.     }
+{                                                                              }
+{ The whole edit batch is wrapped in ProcessControl.PreProcess /              }
+{ PostProcess('Edit') so Altium's undo stack records it as one step. Each    }
+{ label modification is bracketed by SchBeginModify / SchEndModify on the    }
+{ ISch_Label so the SchServer broadcasts a refresh for that primitive.      }
+{ MarkLibDirty fires once at the end; saves are deferred per the project-    }
+{ side perf_deferred_save pattern.                                            }
+{                                                                              }
+{ Params (any combination of style fields, omitted ones are left untouched): }
+{   library_path                  - .SchLib path. Defaults to focused doc.   }
+{   component_name                - optional, single-component mode.         }
+{   target=designator|comment|parameter:<name>  (default 'designator')      }
+{   font_id, color, is_hidden, orientation, justification - new style values }
+{   only_mismatched=true|false    (default true) - skip already-compliant   }
+{   limit=5000                    - cap on processed components in bulk     }
+{                                                                              }
+{ Returns: {library_path, target, scope, total, modified, already_compliant, }
+{          missing_target, failed, limit, truncated}.                         }
+Procedure ResolveTargetLabel(Component : ISch_Component; Target : String;
+    Var Lbl : ISch_Label; Var Found : Boolean);
+Var
+    Iter : ISch_Iterator;
+    Param : ISch_Parameter;
+    ParamName : String;
+Begin
+    Lbl := Nil;
+    Found := False;
+
+    If Target = 'designator' Then
+    Begin
+        Try Lbl := Component.Designator; Found := (Lbl <> Nil); Except End;
+    End
+    Else If Target = 'comment' Then
+    Begin
+        Try Lbl := Component.Comment; Found := (Lbl <> Nil); Except End;
+    End
+    Else If Pos('parameter:', Target) = 1 Then
+    Begin
+        ParamName := Copy(Target, 11, Length(Target) - 10);
+        If ParamName = '' Then Exit;
+        Iter := Component.SchIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eParameter));
+        Try
+            Param := Iter.FirstSchObject;
+            While Param <> Nil Do
+            Begin
+                If Param.Name = ParamName Then
+                Begin
+                    Lbl := Param;
+                    Found := True;
+                    Break;
+                End;
+                Param := Iter.NextSchObject;
+            End;
+        Finally
+            Component.SchIterator_Destroy(Iter);
+        End;
+    End;
+End;
+
+Function ApplyLabelFormat(Lbl : ISch_Label;
+    HasFontId : Boolean; NewFontId : Integer;
+    HasColor : Boolean; NewColor : Integer;
+    HasIsHidden : Boolean; NewIsHidden : Boolean;
+    HasOrientation : Boolean; NewOrientation : Integer;
+    HasJustification : Boolean; NewJustification : Integer;
+    OnlyMismatched : Boolean) : Integer;
+{ Returns 1 if modified, 0 if compliant (skipped), -1 if the write itself     }
+{ raised (counted as failed by the caller).                                   }
+Var
+    Compliant : Boolean;
+Begin
+    Result := 0;
+    If Lbl = Nil Then Exit;
+
+    If OnlyMismatched Then
+    Begin
+        Compliant := True;
+        If HasFontId Then
+            Try If Lbl.FontId <> NewFontId Then Compliant := False; Except End;
+        If Compliant And HasColor Then
+            Try If Lbl.Color <> NewColor Then Compliant := False; Except End;
+        If Compliant And HasIsHidden Then
+            Try If Lbl.IsHidden <> NewIsHidden Then Compliant := False; Except End;
+        If Compliant And HasOrientation Then
+            Try If Lbl.Orientation <> NewOrientation Then Compliant := False; Except End;
+        If Compliant And HasJustification Then
+            Try If Lbl.Justification <> NewJustification Then Compliant := False; Except End;
+        If Compliant Then Exit;
+    End;
+
+    Try
+        SchBeginModify(Lbl);
+        If HasFontId Then Lbl.FontId := NewFontId;
+        If HasColor Then Lbl.Color := NewColor;
+        If HasIsHidden Then Lbl.IsHidden := NewIsHidden;
+        If HasOrientation Then Lbl.Orientation := NewOrientation;
+        If HasJustification Then Lbl.Justification := NewJustification;
+        SchEndModify(Lbl);
+        Result := 1;
+    Except
+        Result := -1;
+    End;
+End;
+
+Function Lib_SetLabelFormat(Params : String; RequestId : String) : String;
+Var
+    LibPath, FocusedPath, Target, CompName, FlagStr : String;
+    HasFontId, HasColor, HasIsHidden, HasOrientation, HasJustification : Boolean;
+    NewFontId, NewColor, NewOrientation, NewJustification : Integer;
+    NewIsHidden, OnlyMismatched, Found : Boolean;
+    Workspace : IWorkspace;
+    Doc : IDocument;
+    SchLib : ISch_Lib;
+    LibReader : ILibCompInfoReader;
+    CompInfo : IComponentInfo;
+    Component : ISch_Component;
+    Lbl : ISch_Label;
+    Limit, Total, Modified, AlreadyCompliant, MissingTarget, Failed, NumComps, I, ApplyResult : Integer;
+    Scope : String;
+Begin
+    LibPath := ExtractJsonValue(Params, 'library_path');
+    LibPath := StringReplace(LibPath, '\\', '\', -1);
+    Target := ExtractJsonValue(Params, 'target');
+    If Target = '' Then Target := 'designator';
+    CompName := ExtractJsonValue(Params, 'component_name');
+
+    HasFontId := ExtractJsonValue(Params, 'font_id') <> '';
+    NewFontId := StrToIntDef(ExtractJsonValue(Params, 'font_id'), 0);
+    HasColor := ExtractJsonValue(Params, 'color') <> '';
+    NewColor := StrToIntDef(ExtractJsonValue(Params, 'color'), 0);
+    HasIsHidden := ExtractJsonValue(Params, 'is_hidden') <> '';
+    NewIsHidden := False;
+    FlagStr := ExtractJsonValue(Params, 'is_hidden');
+    If (FlagStr = 'true') Or (FlagStr = 'True') Or (FlagStr = '1') Then NewIsHidden := True;
+    HasOrientation := ExtractJsonValue(Params, 'orientation') <> '';
+    NewOrientation := StrToIntDef(ExtractJsonValue(Params, 'orientation'), 0);
+    HasJustification := ExtractJsonValue(Params, 'justification') <> '';
+    NewJustification := StrToIntDef(ExtractJsonValue(Params, 'justification'), 0);
+
+    FlagStr := ExtractJsonValue(Params, 'only_mismatched');
+    OnlyMismatched := (FlagStr <> 'false') And (FlagStr <> 'False') And (FlagStr <> '0');
+
+    Limit := StrToIntDef(ExtractJsonValue(Params, 'limit'), 5000);
+
+    If (Not HasFontId) And (Not HasColor) And (Not HasIsHidden)
+        And (Not HasOrientation) And (Not HasJustification) Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NOTHING_TO_SET',
+            'At least one of font_id / color / is_hidden / orientation / justification must be supplied');
+        Exit;
+    End;
+
+    Workspace := GetWorkspace;
+    If Workspace = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_WORKSPACE', 'No workspace');
+        Exit;
+    End;
+
+    FocusedPath := '';
+    Doc := Workspace.DM_FocusedDocument;
+    If Doc <> Nil Then Try FocusedPath := Doc.DM_FullPath; Except End;
+    If LibPath = '' Then LibPath := FocusedPath;
+    If LibPath = '' Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_LIBRARY',
+            'No library document is active and no library_path was supplied');
+        Exit;
+    End;
+
+    If (FocusedPath = '') Or (UpperCase(FocusedPath) <> UpperCase(LibPath)) Then
+    Begin
+        ResetParameters;
+        AddStringParameter('ObjectKind', 'Document');
+        AddStringParameter('FileName', LibPath);
+        RunProcess('WorkspaceManager:OpenObject');
+    End;
+
+    SchLib := SchServer.GetCurrentSchDocument;
+    If (SchLib = Nil) Or (SchLib.ObjectId <> eSchLib) Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_SCHLIB',
+            'Failed to focus library at ' + LibPath);
+        Exit;
+    End;
+
+    Total := 0;
+    Modified := 0;
+    AlreadyCompliant := 0;
+    MissingTarget := 0;
+    Failed := 0;
+
+    SchServer.ProcessControl.PreProcess(SchLib, '');
+    Try
+        If CompName <> '' Then
+        Begin
+            { Single-component mode. }
+            Scope := 'single';
+            Component := SchLib.GetState_SchComponentByLibRef(CompName);
+            If Component = Nil Then
+            Begin
+                Result := BuildErrorResponse(RequestId, 'COMPONENT_NOT_FOUND',
+                    'Component not found in library: ' + CompName);
+                Exit;
+            End;
+            Total := 1;
+            ResolveTargetLabel(Component, Target, Lbl, Found);
+            If Not Found Then
+                Inc(MissingTarget)
+            Else
+            Begin
+                ApplyResult := ApplyLabelFormat(Lbl, HasFontId, NewFontId,
+                    HasColor, NewColor, HasIsHidden, NewIsHidden,
+                    HasOrientation, NewOrientation, HasJustification, NewJustification,
+                    OnlyMismatched);
+                If ApplyResult = 1 Then Inc(Modified)
+                Else If ApplyResult = 0 Then Inc(AlreadyCompliant)
+                Else Inc(Failed);
+            End;
+        End
+        Else
+        Begin
+            { Bulk mode: walk library via CompInfoReader, same enumeration as }
+            { Lib_GetComponents and Lib_AuditStyles.                            }
+            Scope := 'bulk';
+            LibReader := SchServer.CreateLibCompInfoReader(LibPath);
+            If LibReader = Nil Then
+            Begin
+                Result := BuildErrorResponse(RequestId, 'READER_FAILED',
+                    'Failed to create library reader for ' + LibPath);
+                Exit;
+            End;
+            Try
+                LibReader.ReadAllComponentInfo;
+                NumComps := LibReader.NumComponentInfos;
+
+                For I := 0 To NumComps - 1 Do
+                Begin
+                    If Total >= Limit Then Break;
+                    CompInfo := LibReader.ComponentInfos[I];
+                    CompName := '';
+                    Try CompName := CompInfo.CompName; Except End;
+                    If CompName = '' Then Continue;
+                    Component := SchLib.GetState_SchComponentByLibRef(CompName);
+                    If Component = Nil Then Continue;
+                    Inc(Total);
+
+                    ResolveTargetLabel(Component, Target, Lbl, Found);
+                    If Not Found Then
+                    Begin
+                        Inc(MissingTarget);
+                        Continue;
+                    End;
+
+                    ApplyResult := ApplyLabelFormat(Lbl, HasFontId, NewFontId,
+                        HasColor, NewColor, HasIsHidden, NewIsHidden,
+                        HasOrientation, NewOrientation, HasJustification, NewJustification,
+                        OnlyMismatched);
+                    If ApplyResult = 1 Then Inc(Modified)
+                    Else If ApplyResult = 0 Then Inc(AlreadyCompliant)
+                    Else Inc(Failed);
+                End;
+            Finally
+                SchServer.DestroyCompInfoReader(LibReader);
+            End;
+        End;
+    Finally
+        SchServer.ProcessControl.PostProcess(SchLib, 'Edit');
+    End;
+
+    If Modified > 0 Then MarkLibDirty(SchLib);
+
+    Try SchLib.GraphicallyInvalidate; Except End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"library_path":"' + EscapeJsonString(LibPath) + '"' +
+        ',"target":"' + EscapeJsonString(Target) + '"' +
+        ',"scope":"' + EscapeJsonString(Scope) + '"' +
+        ',"total":' + IntToStr(Total) +
+        ',"modified":' + IntToStr(Modified) +
+        ',"already_compliant":' + IntToStr(AlreadyCompliant) +
+        ',"missing_target":' + IntToStr(MissingTarget) +
+        ',"failed":' + IntToStr(Failed) +
+        ',"limit":' + IntToStr(Limit) +
+        ',"truncated":' + BoolToJsonStr(Total >= Limit) + '}');
 End;
 
 {..............................................................................}
@@ -2549,6 +3683,8 @@ Begin
         'set_component_description': Result := Lib_SetComponentDescription(Params, RequestId);
         'get_pin_list':       Result := Lib_GetPinList(Params, RequestId);
         'copy_component':     Result := Lib_CopyComponent(Params, RequestId);
+        'audit_styles':       Result := Lib_AuditStyles(Params, RequestId);
+        'set_label_format':   Result := Lib_SetLabelFormat(Params, RequestId);
     Else
         Result := BuildErrorResponse(RequestId, 'UNKNOWN_ACTION', 'Unknown library action: ' + Action);
     End;

@@ -6,7 +6,7 @@ Provides high-level PCB operations: net classes, design rules, DRC,
 component placement, trace lengths, layer stackup, board outline, etc.
 """
 
-from typing import Any
+from typing import Any, Optional
 from ..bridge import get_bridge
 from .bulk_hints import BulkHintTracker
 from .datasheet_hints import tag_response
@@ -30,7 +30,7 @@ def register_pcb_tools(mcp):
     async def pcb_get_net_classes() -> dict[str, Any]:
         """Get all net classes from the active PCB.
 
-        Only returns class metadata — IPCB_ObjectClass.MemberCount and
+        Only returns class metadata, IPCB_ObjectClass.MemberCount and
         MemberName[] are not exposed in Altium's DelphiScript host, so
         per-member enumeration has to be done by iterating eNetObject and
         grouping by each net's parent class.
@@ -120,7 +120,7 @@ def register_pcb_tools(mcp):
     ) -> dict[str, Any]:
         """Move and/or rotate ONE PCB component by its designator.
 
-        IMPORTANT — if you need to reposition more than one component,
+        IMPORTANT, if you need to reposition more than one component,
         use `pcb_move_components` (batch) instead. Looping this tool is
         the single biggest wall-time cost: each call is a full LLM
         round-trip, but the batch version does N moves in one turn.
@@ -168,10 +168,10 @@ def register_pcb_tools(mcp):
 
         Args:
             moves: List of move dicts. Each dict supports:
-                designator (required)  — target component
-                x        (optional)    — new X in mils
-                y        (optional)    — new Y in mils
-                rotation (optional)    — new rotation in degrees
+                designator (required) , target component
+                x        (optional)   , new X in mils
+                y        (optional)   , new Y in mils
+                rotation (optional)   , new rotation in degrees
 
             Example:
                 [
@@ -263,7 +263,7 @@ def register_pcb_tools(mcp):
         Calls IPCB_LayerStack.InsertLayer with the requested TLayer enum.
         Valid names include MidLayer1..MidLayer30 (signal layers) and
         InternalPlane1..InternalPlane16 (power / ground planes). Top / Bottom
-        are always present — they cannot be added.
+        are always present, they cannot be added.
 
         Args:
             layer: Layer name, e.g. "MidLayer1", "InternalPlane1"
@@ -604,7 +604,7 @@ def register_pcb_tools(mcp):
 
         IMPORTANT: If you are about to place more than one segment
         (multi-segment manhattan routes, a whole net, a batch of
-        traces), use `pcb_place_tracks` instead — it takes a list of
+        traces), use `pcb_place_tracks` instead, it takes a list of
         segments and runs them in a single IPC round-trip, which is
         dramatically faster than calling this tool repeatedly.
 
@@ -805,7 +805,7 @@ def register_pcb_tools(mcp):
     ) -> dict[str, Any]:
         """Start INTERACTIVE polygon pour placement on the active PCB.
 
-        This is an interactive command — it launches Altium's polygon
+        This is an interactive command, it launches Altium's polygon
         placement mode. The user must then draw the polygon boundary
         interactively in Altium Designer (clicks define vertices, right-click
         or Escape completes). It does NOT create a polygon programmatically
@@ -830,31 +830,62 @@ def register_pcb_tools(mcp):
         name: str,
         rule_type: str = "clearance",
         value: int = 10,
+        max_value: Optional[int] = None,
+        favored_value: Optional[int] = None,
+        max_uncoupled_length: Optional[int] = None,
         scope: str = "",
         net_scope: str = "different_nets",
     ) -> dict[str, Any]:
         """Create a new design rule on the active PCB.
 
         Args:
-            name: Rule name (e.g., "Min Clearance 6mil")
+            name: Rule name (e.g., "Min Clearance 6mil").
             rule_type: Type of rule to create. Options:
-                "clearance" - Electrical clearance (value = gap in mils)
-                "width" - Track width constraint (value = min width in mils,
-                    max auto-set to 5x min)
-                "via_size" - Hole size constraint (value = min hole in mils,
-                    max auto-set to 5x min)
-            value: Rule value in mils (default 10)
-            scope: Optional query expression for Scope1
-                (e.g., "InNet('GND')", "All")
+                ``"clearance"`` - Electrical clearance (value = gap in mils).
+                ``"width"`` - Track width constraint (value = min width
+                    in mils; max_value / favored_value optional).
+                ``"via_size"`` - Hole size constraint (value = min hole
+                    in mils; max_value optional).
+                ``"differential_pairs"`` - Differential-pair routing rule
+                    (value = min gap, max_value = max gap,
+                    favored_value = preferred gap, max_uncoupled_length =
+                    max uncoupled length in mils).
+            value: Rule's primary value in mils. For width / via_size /
+                differential_pairs this is the MIN side. Default 10.
+            max_value: For width / via_size / differential_pairs. When
+                supplied, sets the MAX side independently of value. When
+                None, falls back to 5x value (legacy default).
+            favored_value: For width / differential_pairs. Sets the
+                preferred value. Defaults to value when None.
+            max_uncoupled_length: For differential_pairs only.
+                MaxUncoupledLength in mils (single scalar, not per-layer).
+                Defaults to 1000 mils when None.
+            scope: Optional query expression for Scope1. Pick the
+                predicate that matches the rule kind:
+                  - net-based rules (clearance, width, via_size):
+                    ``"InNet('GND')"``, ``"InNetClass('Power')"``,
+                    ``"All"``.
+                  - differential_pairs: ``"InDifferentialPair('USB')"``,
+                    ``"InDifferentialPairClass('HighSpeed')"``,
+                    ``"IsDifferentialPair"`` (matches any diff pair),
+                    or ``"All"``.
+                Mixing predicates across kinds (e.g., ``InNet`` on a
+                differential_pairs rule) creates a rule that never matches.
             net_scope: Which nets the rule applies between. Options:
-                "different_nets" (default) - only between pads/tracks of
-                    different nets. This is what you want for Clearance.
-                "any_net" - include same-net objects (flags a track
-                    touching a pad of its own net — almost always a bug).
-                "same_net" - only between same-net objects.
+                ``"different_nets"`` (default) for Clearance rules;
+                ``"any_net"`` for all-pairs; ``"same_net"`` for same-net
+                only. Has no effect on differential_pairs.
 
         Returns:
-            Dictionary with created rule details
+            Dictionary with created rule details.
+
+        Note: Creating ComponentClearance, HoleToHoleClearance,
+        BoardOutlineClearance, and other newer rule kinds is not
+        supported on this Altium build because the relevant symbolic
+        constants (eRule_ComponentClearance, ...) are not exposed in
+        DelphiScript. Existing rules of those kinds can be UPDATED via
+        ``pcb_set_rule_properties`` (gap_mils field), which dispatches
+        through Rule.RuleKind without needing the symbol.
         """
         bridge = get_bridge()
         params: dict[str, Any] = {
@@ -863,6 +894,12 @@ def register_pcb_tools(mcp):
             "value": str(value),
             "net_scope": net_scope,
         }
+        if max_value is not None:
+            params["max_value"] = str(max_value)
+        if favored_value is not None:
+            params["favored_value"] = str(favored_value)
+        if max_uncoupled_length is not None:
+            params["max_uncoupled_length"] = str(max_uncoupled_length)
         if scope:
             params["scope"] = scope
         result = await bridge.send_command_async("pcb.create_design_rule", params)
@@ -896,19 +933,39 @@ def register_pcb_tools(mcp):
         Returns detailed pad information including pin name, position,
         net assignment, size, and hole information.
 
+        DATASHEET DISCIPLINE: Pad name -> pin function mapping comes
+        from the footprint, which can be wrong (especially the thermal
+        pad on QFN/DFN, which is rarely numbered consistently across
+        vendors). Before stating which pin a pad corresponds to,
+        cross-check the manufacturer datasheet's mechanical /
+        recommended-land-pattern section. The response carries
+        `_datasheet_guidance` + `_datasheet_parts`.
+
         Args:
             designator: Component reference designator (e.g., "U1", "J3")
 
         Returns:
             Dictionary with "designator", "pads" array (each with name,
             x, y, net, layer, hole_size, top_x_size, top_y_size,
-            rotation), and "pad_count"
+            rotation), "pad_count", plus `_datasheet_guidance` +
+            `_datasheet_parts`.
         """
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "pcb.get_component_pads",
             {"designator": designator},
         )
+        if isinstance(result, dict):
+            explicit = [{
+                "manufacturer": "",
+                "part_number": "",
+                "designators": designator,
+            }]
+            return tag_response(
+                result,
+                explicit_parts=explicit,
+                context="pcb_get_component_pads",
+            )
         return result
 
     @mcp.tool()
@@ -987,7 +1044,7 @@ def register_pcb_tools(mcp):
     async def pcb_get_diff_pair_rules() -> dict[str, Any]:
         """Get all differential pair routing rules from PCB design rules.
 
-        Returns design rules of kind eRule_DifferentialPairsRouting — these
+        Returns design rules of kind eRule_DifferentialPairsRouting, these
         are routing rules, NOT IPCB_DifferentialPair pair objects on the board.
 
         Returns:
@@ -1169,7 +1226,7 @@ def register_pcb_tools(mcp):
     async def pcb_get_room_rules() -> dict[str, Any]:
         """Get all room-like rules (confinement constraint design rules).
 
-        Returns design rules of kind eRule_ConfinementConstraint — these are
+        Returns design rules of kind eRule_ConfinementConstraint, these are
         NOT physical IPCB_Room objects on the board. The rule bounding rect
         is reported as x1/y1/x2/y2 in mils.
 
@@ -1241,7 +1298,7 @@ def register_pcb_tools(mcp):
 
     @mcp.tool()
     async def pcb_export_coordinates() -> dict[str, Any]:
-        """Export component placement coordinates — same as pcb_get_components but formatted for pick-and-place.
+        """Export component placement coordinates, same as pcb_get_components but formatted for pick-and-place.
 
         Returns designator, footprint, comment, position (x, y),
         rotation, layer, and side (Top/Bottom) for every component.
@@ -1489,7 +1546,7 @@ def register_pcb_tools(mcp):
 
         Moves each named component so its X (or Y) coordinate lands at
         equally-spaced stops from `start` to `end`. Order follows the
-        designators list — designators="R1,R2,R3" with start=0 end=200
+        designators list, designators="R1,R2,R3" with start=0 end=200
         places R1 at 0, R2 at 100, R3 at 200 on the chosen axis. Y (or X)
         is untouched.
 
@@ -1516,28 +1573,28 @@ def register_pcb_tools(mcp):
 
     @mcp.tool()
     async def pcb_get_rule_properties(name: str) -> dict[str, Any]:
-        """Read the full property set of a named PCB design rule.
+        """Read properties of a named PCB design rule.
 
-        `pcb_get_design_rules` returns only metadata (name, kind, scope,
-        enabled). This tool returns the actual numeric values that
-        drive DRC: clearance gap, min/max/preferred trace width
-        (per layer, reported at the top layer), min/max hole size,
-        via diameters, parallel-segment limits, and min/max
-        impedance. Properties that don't apply to the rule's kind
-        are silently skipped — you get back only the keys that are
-        meaningful for this specific rule.
+        Returns metadata (name, rule_kind, enabled, priority) plus a
+        ``descriptor`` string that contains the rule's constraint values
+        in human-readable form, e.g.:
+
+            "Width Constraint (Min=0.102mm) (Max=5.08mm) (Preferred=0.127mm) (All)"
+            "Clearance Constraint (Gap=0.127mm) (All),(All)"
+            "Hole Size Constraint (Min=0.1mm) (Max=4mm) (All)"
+            "Routing Via (Templates Used To Check Via: v30h10m0mx0, ...) (All)"
+
+        Constraint values live on per-kind subtype interfaces
+        (IPCB_ClearanceConstraint, IPCB_MaxMinWidthConstraint, ...) which
+        cannot be safely accessed from a base IPCB_Rule reference in
+        DelphiScript, so we surface the descriptor string instead. Parse
+        it client-side if you need numeric values.
 
         Args:
             name: Design rule name (e.g., "Clearance", "Width", "RoutingVias").
 
         Returns:
-            Dict with name, rule_kind, enabled, priority, plus any of:
-            gap_mils, min_width_mils, max_width_mils, preferred_width_mils,
-            min_limit_mils, max_limit_mils, min_hole_size_mils,
-            max_hole_size_mils, preferred_hole_size_mils,
-            min_width_via_mils, max_width_via_mils, preferred_width_via_mils,
-            parallel_limit_mils, parallel_gap_mils,
-            min_impedance, max_impedance, preferred_impedance.
+            Dict with name, rule_kind, enabled, priority, descriptor.
         """
         bridge = get_bridge()
         return await bridge.send_command_async(
@@ -1547,69 +1604,67 @@ def register_pcb_tools(mcp):
     @mcp.tool()
     async def pcb_set_rule_properties(
         name: str,
-        gap_mils: int | None = None,
-        min_width_mils: int | None = None,
-        max_width_mils: int | None = None,
-        preferred_width_mils: int | None = None,
-        min_limit_mils: int | None = None,
-        max_limit_mils: int | None = None,
-        min_hole_size_mils: int | None = None,
-        max_hole_size_mils: int | None = None,
-        preferred_hole_size_mils: int | None = None,
-        min_impedance: float | None = None,
-        max_impedance: float | None = None,
-        preferred_impedance: float | None = None,
         enabled: bool | None = None,
-        priority: int | None = None,
         scope1: str | None = None,
         scope2: str | None = None,
         comment: str | None = None,
+        gap_mils: int | None = None,
+        min_width_mils: int | None = None,
+        max_width_mils: int | None = None,
+        favored_width_mils: int | None = None,
+        min_hole_size_mils: int | None = None,
+        max_hole_size_mils: int | None = None,
     ) -> dict[str, Any]:
-        """Update kind-specific properties of a named PCB design rule.
+        """Update metadata AND constraint values of a named PCB design rule.
 
-        Pass only the parameters you want to change; leave the rest at
-        None. Properties that don't apply to this rule's kind are
-        silently ignored (trying to set gap_mils on a Width rule is
-        a no-op, not an error). Width properties are applied to every
-        copper layer.
+        Metadata fields always apply. Constraint fields are dispatched
+        by the rule's underlying RuleKind:
+
+        - Clearance (kind 0), ComponentClearance (kind 24), and
+          HoleToHoleClearance (kind 52): ``gap_mils``. All three share
+          the Gap property on IPCB_ClearanceConstraint.
+        - Width (kind 2): ``min_width_mils`` / ``max_width_mils`` /
+          ``favored_width_mils`` (applied to every layer).
+        - HoleSize (kind 42): ``min_hole_size_mils`` / ``max_hole_size_mils``.
+
+        Pass only the parameters you want to change; everything else
+        stays untouched. Each successful field write increments
+        ``properties_updated`` in the response.
+
+        NOTE: Priority is NOT writable from this tool. ``IPCB_Rule.Priority``
+        is a read-only function in the PCB scripting API
+        (``Function Priority : TRulePrecedence``), not a property; there
+        is no ``SetState_Priority`` or ``SetPriority`` method either.
+        Assigning to it crashes the DelphiScript engine. To reorder rule
+        priorities, drag them in Altium's UI (PCB > Rules and Constraints
+        Editor; rules earlier in a category have higher priority).
 
         Args:
             name: Rule name to update.
-            gap_mils: Clearance (for Clearance rules).
-            min_width_mils / max_width_mils / preferred_width_mils:
-                For Width rules. Applied across all layers.
-            min_limit_mils / max_limit_mils: Generic min/max
-                (hole size, flight time, etc.).
-            min_hole_size_mils / max_hole_size_mils /
-                preferred_hole_size_mils: For via rules.
-            min_impedance / max_impedance / preferred_impedance:
-                For MaxMinImpedance rules (ohms).
             enabled: Whether DRC enforces the rule.
-            priority: Rule priority (lower number = higher priority).
             scope1 / scope2: Rule scope query expressions.
             comment: Free-form comment.
+            gap_mils: Clearance gap. Applies to Clearance,
+                ComponentClearance, and HoleToHoleClearance rules.
+            min_width_mils / max_width_mils / favored_width_mils:
+                Width constraint values (applied to every layer).
+            min_hole_size_mils / max_hole_size_mils: HoleSize
+                constraint limits.
 
         Returns:
-            Dict with name and properties_updated count.
+            Dict with name, rule_kind, and properties_updated count.
         """
         params: dict[str, Any] = {"name": name}
         for key, value in [
-            ("gap_mils", gap_mils),
-            ("min_width_mils", min_width_mils),
-            ("max_width_mils", max_width_mils),
-            ("preferred_width_mils", preferred_width_mils),
-            ("min_limit_mils", min_limit_mils),
-            ("max_limit_mils", max_limit_mils),
-            ("min_hole_size_mils", min_hole_size_mils),
-            ("max_hole_size_mils", max_hole_size_mils),
-            ("preferred_hole_size_mils", preferred_hole_size_mils),
-            ("min_impedance", min_impedance),
-            ("max_impedance", max_impedance),
-            ("preferred_impedance", preferred_impedance),
-            ("priority", priority),
             ("scope1", scope1),
             ("scope2", scope2),
             ("comment", comment),
+            ("gap_mils", gap_mils),
+            ("min_width_mils", min_width_mils),
+            ("max_width_mils", max_width_mils),
+            ("favored_width_mils", favored_width_mils),
+            ("min_hole_size_mils", min_hole_size_mils),
+            ("max_hole_size_mils", max_hole_size_mils),
         ]:
             if value is not None:
                 params[key] = str(value)

@@ -7,7 +7,7 @@ regress: IPC mechanics, JSON escape correctness, return-type contracts,
 and DelphiScript invariants that are expensive or impossible to verify
 any other way.
 
-Tests that merely grepped source files for substrings have been removed —
+Tests that merely grepped source files for substrings have been removed;
 a passing substring-match proves nothing about runtime behaviour and is
 trivially defeated by a comment.
 
@@ -55,19 +55,22 @@ def _event_loop():
 
 
 # =========================================================================
-# Stale response cleanup
+# Per-request file isolation
 # =========================================================================
 
-class TestStaleResponseDeletion:
-    """A response file with a mismatching id must be deleted so the next
-    request can complete."""
+class TestPerRequestFileIsolation:
+    """With per-request response files, a foreign caller's response file
+    is invisible to our poll, there is no "stale ID" race to handle."""
 
-    def test_stale_response_deleted_on_id_mismatch(self, tmp_path):
-        """If response.json has wrong ID, it should be deleted."""
+    def test_foreign_response_does_not_disturb_poll(self, tmp_path):
+        from eda_agent.config import AltiumConfig, MCPRuntimeConfig
+
         config = AltiumConfig(
             workspace_dir=tmp_path,
-            poll_interval=0.01,
-            poll_timeout=0.5,
+            runtime=MCPRuntimeConfig(
+                py_poll_interval_seconds=0.01,
+                py_poll_timeout_seconds=0.5,
+            ),
         )
         bridge = AltiumBridge.__new__(AltiumBridge)
         bridge.config = config
@@ -79,15 +82,21 @@ class TestStaleResponseDeletion:
 
         bridge.process_manager = FakePM()
 
-        response_path = config.response_path
-        stale = {"id": "wrong-id", "success": True, "data": "stale", "error": None}
-        response_path.write_text(json.dumps(stale), encoding="latin-1")
+        # Drop a foreign response file in the workspace
+        foreign_path = tmp_path / "response_foreigncaller.json"
+        foreign = {
+            "protocol_version": 2, "id": "foreigncaller",
+            "success": True, "data": "stale", "error": None,
+        }
+        foreign_path.write_text(json.dumps(foreign), encoding="utf-8")
 
+        # Polling for a different ID times out without consuming the foreign file
         with pytest.raises(AltiumTimeoutError):
-            bridge._poll_response("correct-id", timeout=0.3)
+            bridge._poll_response("correctid", timeout=0.3)
 
-        assert not response_path.exists(), (
-            "Stale response file should be deleted when ID doesn't match"
+        assert foreign_path.exists(), (
+            "Foreign caller's response file must be left alone, per-request "
+            "files mean we never touch responses we don't own."
         )
 
 
@@ -136,7 +145,7 @@ class TestBatchFileLatin1Encoding:
 class TestNoPerObjectPreProcess:
     """In DelphiScript, the second argument to PreProcess / PostProcess
     must be a string, not an object. Passing an object silently fails at
-    runtime — no simulator can reproduce that, so we lock the source
+    runtime, no simulator can reproduce that, so we lock the source
     pattern down instead.
     """
 
@@ -225,19 +234,19 @@ class TestEmptyRequestCleanup:
     consumed."""
 
     def test_empty_request_removed(self, altium_sim):
-        request_path = altium_sim.workspace_dir / "request.json"
+        request_path = altium_sim.workspace_dir / "request_emptytestone.json"
         request_path.write_text("", encoding="utf-8")
         time.sleep(0.1)
         assert not request_path.exists(), "Empty request file must be deleted"
 
 
 # =========================================================================
-# BuildObjectJson — no trailing comma
+# BuildObjectJson, no trailing comma
 # =========================================================================
 
 class TestNoTrailingComma:
     """BuildObjectJson must not emit a trailing comma before the closing
-    brace when the property list is empty — otherwise Python's JSON
+    brace when the property list is empty, otherwise Python's JSON
     parser would reject every query response."""
 
     def test_query_returns_valid_json(self, altium_sim, e2e_bridge):
@@ -334,8 +343,13 @@ class TestRequestDeletedBeforeValidation:
 
     def test_bad_request_still_removed(self, altium_sim):
         """Even an invalid request (empty command) must be removed from disk."""
-        request_path = altium_sim.workspace_dir / "request.json"
-        bad_request = {"id": "test-123", "command": "", "params": {}}
+        request_path = altium_sim.workspace_dir / "request_badtest123.json"
+        bad_request = {
+            "protocol_version": 2,
+            "id": "badtest123",
+            "command": "",
+            "params": {},
+        }
         request_path.write_text(json.dumps(bad_request), encoding="utf-8")
         time.sleep(0.15)
         assert not request_path.exists()
@@ -371,7 +385,7 @@ class TestResetBridgeExported:
 
 class TestE2E_QueryModifyRoundTrip:
     """query_objects followed by modify_objects followed by another query
-    must observe the change — the full IPC + generic-primitive stack."""
+    must observe the change, the full IPC + generic-primitive stack."""
 
     def test_query_and_modify_roundtrip(self, altium_sim, e2e_bridge):
         result = e2e_bridge.send_command(
@@ -441,7 +455,7 @@ class TestE2E_SpecialCharsRoundTrip:
 
 class TestE2E_SetParameterRoundTrip:
     """project.set_parameter followed by project.get_parameters must
-    reflect the new value — covers the write + read path end-to-end."""
+    reflect the new value, covers the write + read path end-to-end."""
 
     def test_set_and_get_parameter(self, altium_sim, e2e_bridge):
         result = e2e_bridge.send_command(
@@ -478,13 +492,13 @@ class TestInstallScriptsIncludesDfm:
 
         assert pas_files, ".pas files should be copied"
         assert dfm_files, (
-            ".dfm files MUST be copied — without them DFM-backed forms fail "
+            ".dfm files MUST be copied, without them DFM-backed forms fail "
             "to compile at Altium startup (issue #2)"
         )
 
         statusform_dfm = tmp_path / "StatusForm.dfm"
         assert statusform_dfm.exists(), (
-            "StatusForm.dfm specifically must be copied — it is referenced "
+            "StatusForm.dfm specifically must be copied, it is referenced "
             "by the Altium_API.PrjScr and required for the dashboard"
         )
 
@@ -518,12 +532,11 @@ class TestInstallScriptsIncludesDfm:
         )
 
 
-class TestIpcLockSerializesConcurrentCalls:
+class TestConcurrentCallsBothComplete:
     """Two threads calling send_command concurrently must each receive
-    their own response. Before the IPC lock, concurrent pollers would
-    read and delete each other's response files as 'stale', causing
-    one of the two calls to timeout even though both had a response
-    written. Regression for the keep-alive/user-call race.
+    their own response. With per-request response files (response_<id>.json)
+    each caller polls only for its own filename, so concurrent pollers
+    cannot collide. Regression for the keep-alive/user-call race.
     """
 
     def test_concurrent_send_commands_both_complete(self, altium_sim, e2e_bridge):
@@ -551,11 +564,10 @@ class TestIpcLockSerializesConcurrentCalls:
         for tag, result in results.items():
             assert result is not None, f"Thread {tag} got None"
 
-    def test_ipc_lock_exists_on_bridge(self, e2e_bridge):
-        import threading
-        assert hasattr(e2e_bridge, "_ipc_lock"), (
-            "AltiumBridge must expose _ipc_lock — the serialization primitive "
-            "that prevents concurrent pollers from deleting each other's "
-            "responses as stale"
+    def test_no_ipc_lock_needed(self, e2e_bridge):
+        """Per-request files eliminate the cross-caller race; the bridge no
+        longer carries an _ipc_lock attribute."""
+        assert not hasattr(e2e_bridge, "_ipc_lock"), (
+            "AltiumBridge should not expose _ipc_lock, per-request files "
+            "make the lock unnecessary."
         )
-        assert isinstance(e2e_bridge._ipc_lock, type(threading.Lock()))

@@ -16,7 +16,7 @@ import re
 
 
 # ---------------------------------------------------------------------------
-# Python reimplementations — EXACT mirrors of DelphiScript
+# Python reimplementations, EXACT mirrors of DelphiScript
 # ---------------------------------------------------------------------------
 
 
@@ -144,30 +144,37 @@ def escape_json_string(s: str) -> str:
     return result
 
 
-def build_success_response(request_id: str, data: str) -> str:
-    """Mirror: Main.pas:146 BuildSuccessResponse
+PROTOCOL_VERSION = 2
 
-    NOTE: data is a raw JSON string, not a Python object. The DelphiScript
-    concatenates it directly into the response JSON string.
-    """
+
+def build_success_response(request_id: str, data: str) -> str:
+    """Mirror: Main.pas BuildSuccessResponse, includes protocol_version."""
     if data == '':
         data = 'null'
-    return '{"id":"' + request_id + '","success":true,"data":' + data + ',"error":null}'
+    return ('{"protocol_version":' + str(PROTOCOL_VERSION) +
+            ',"id":"' + request_id +
+            '","success":true,"data":' + data + ',"error":null}')
 
 
-def build_error_response(request_id: str, error_code: str, error_msg: str) -> str:
-    """Mirror: Main.pas:153 BuildErrorResponse
+def build_error_response(request_id: str, error_code: str, error_msg: str,
+                         details_json: str = '') -> str:
+    """Mirror: Main.pas BuildErrorResponseDetailed.
 
-    The error message gets inline JSON-escaped (same order as EscapeJsonString).
+    Inline JSON-escapes the message (same order as EscapeJsonString).
+    Pass details_json='' for a null details field, or a JSON value string.
     """
-    # Inline escape — same as the DelphiScript in BuildErrorResponse
     error_msg = error_msg.replace('\\', '\\\\')
     error_msg = error_msg.replace('"', '\\"')
     error_msg = error_msg.replace('\r', '\\r')
     error_msg = error_msg.replace('\n', '\\n')
     error_msg = error_msg.replace('\t', '\\t')
-    return ('{"id":"' + request_id + '","success":false,"data":null,'
-            '"error":{"code":"' + error_code + '","message":"' + error_msg + '"}}')
+    details_field = details_json if details_json else 'null'
+    return ('{"protocol_version":' + str(PROTOCOL_VERSION) +
+            ',"id":"' + request_id +
+            '","success":false,"data":null,'
+            '"error":{"code":"' + error_code +
+            '","message":"' + error_msg +
+            '","details":' + details_field + '}}')
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +240,9 @@ class TestExtractJsonValue:
         assert extract_json_value(j, 'name') == 'Jane'
 
     def test_key_is_prefix_of_another(self):
-        """'id' should not match 'id_extra' — it searches for '"id"' exactly."""
+        """'id' should not match 'id_extra', it searches for '"id"' exactly."""
         j = '{"id_extra":"wrong","id":"correct"}'
-        # Finds first occurrence of '"id"' — since '"id_extra"' contains '"id'
+        # Finds first occurrence of '"id"', since '"id_extra"' contains '"id'
         # but not '"id"' followed by whitespace/colon, let's check carefully.
         # Actually '"id_extra"' does NOT contain the exact '"id"' substring
         # because the next char after 'id' is '_' not '"'.
@@ -249,15 +256,15 @@ class TestExtractJsonValue:
         j = '{"request_id":"first","id":"second"}'
         # '"request_id"' does NOT contain '"id"' as substring because
         # the chars before 'id' in '"request_id"' are 'request_' not '"'
-        # Actually let's think again: Pos('"id"', '"request_id"') —
+        # Actually let's think again: Pos('"id"', '"request_id"').
         # '"request_id"' = [", r, e, q, u, e, s, t, _, i, d, "]
         # '"id"' = [", i, d, "]
         # Searching for '"id"' in '{"request_id":"first","id":"second"}'
-        # Position of '"id"' — first occurrence after "request_id" is in "id":"second"
+        # Position of '"id"', first occurrence after "request_id" is in "id":"second"
         # But does 'request_id"' contain '"id"'? Let's check:
-        # ...t_id":"first"... — the sequence '_id":"' contains 'id":'
-        # but we search for '"id"' — that's [quote][i][d][quote]
-        # In '_id":"' we have: _ i d " : " — so 'id"' at positions...
+        # ...t_id":"first"..., the sequence '_id":"' contains 'id":'
+        # but we search for '"id"', that's [quote][i][d][quote]
+        # In '_id":"' we have: _ i d " : ", so 'id"' at positions...
         # The full string: {"request_id":"first","id":"second"}
         # Let me find all occurrences of '"id"':
         # Position: ...quest_id":"first","id":"second"...

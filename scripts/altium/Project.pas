@@ -26,7 +26,10 @@ End;
 
 Function Proj_Create(Params : String; RequestId : String) : String;
 Var
-    ProjectPath, ProjectType : String;
+    ProjectPath, ProjectType, ProjectExt : String;
+    StubContent : String;
+    F : TextFile;
+    Saved : Boolean;
 Begin
     ProjectPath := ExtractJsonValue(Params, 'project_path');
     ProjectPath := StringReplace(ProjectPath, '\\', '\', -1);
@@ -34,12 +37,57 @@ Begin
 
     If ProjectType = '' Then ProjectType := 'PCB';
 
+    // Altium project files are INI-like text. Write a minimal stub directly
+    // to disk so we don't trigger the GUI New Project dialog, then open it
+    // via WorkspaceManager:OpenObject (the documented programmatic open).
+    // The stub is the smallest .PrjPcb that Altium will load and let us
+    // attach documents to.
+    If ProjectType = 'PCB' Then
+    Begin
+        ProjectExt := '.PrjPcb';
+        StubContent :=
+            '[Design]' + #13#10 +
+            'Version=1.0' + #13#10 +
+            'HierarchyMode=0' + #13#10 +
+            'OpenOutputs=1' + #13#10 +
+            'ArchiveProject=0' + #13#10;
+    End
+    Else
+    Begin
+        ProjectExt := '.PrjPcb';
+        StubContent := '[Design]' + #13#10 + 'Version=1.0' + #13#10;
+    End;
+
+    Saved := False;
+    Try
+        AssignFile(F, ProjectPath);
+        Rewrite(F);
+        Try
+            Write(F, StubContent);
+        Finally
+            CloseFile(F);
+        End;
+        Saved := FileExists(ProjectPath);
+    Except
+        Saved := False;
+    End;
+
+    If Not Saved Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'CREATE_FAILED',
+            'Could not write project stub: ' + ProjectPath);
+        Exit;
+    End;
+
+    // Open the freshly-written project so subsequent commands can target it.
     ResetParameters;
     AddStringParameter('ObjectKind', 'Project');
     AddStringParameter('FileName', ProjectPath);
     RunProcess('WorkspaceManager:OpenObject');
 
-    Result := BuildSuccessResponse(RequestId, '{"success":true,"project_path":"' + EscapeJsonString(ProjectPath) + '"}');
+    Result := BuildSuccessResponse(RequestId,
+        '{"success":true,"project_path":"' + EscapeJsonString(ProjectPath) +
+        '","saved":true}');
 End;
 
 Function Proj_Open(Params : String; RequestId : String) : String;
@@ -406,7 +454,7 @@ End;
 { ForceRecompileIfRequested - If Params carries force_recompile=true, flush   }
 { dirty docs to disk, invalidate the SmartCompile cache, and run a fresh      }
 { DM_Compile on the given project. Called by the net/connectivity handlers   }
-{ below, so it must be declared BEFORE them — DelphiScript has no forward    }
+{ below, so it must be declared BEFORE them, DelphiScript has no forward    }
 { declarations (no `Forward;` directive), functions must appear in           }
 { caller-dependency order.                                                    }
 {..............................................................................}
@@ -419,7 +467,7 @@ Begin
     Flag := LowerCase(ExtractJsonValue(Params, 'force_recompile'));
     If (Flag = 'true') Or (Flag = '1') Then
     Begin
-        { Flush editor-side edits first — DM_Compile reads from the          }
+        { Flush editor-side edits first, DM_Compile reads from the          }
         { on-disk project structure in some code paths, and users hit this  }
         { tool precisely when the in-editor state has diverged from the     }
         { cached netlist.                                                   }
@@ -442,7 +490,8 @@ Var
     Doc : IDocument;
     Comp : IComponent;
     Pin : IPin;
-    I, J, K, Count, Limit : Integer;
+    I, J, K, Count, Limit, DocCount : Integer;
+    UsePhysical : Boolean;
     Data, CompDesig, NetName : String;
     First : Boolean;
 Begin
@@ -479,10 +528,11 @@ Begin
     First := True;
     Count := 0;
 
-    For I := 0 To Project.DM_LogicalDocumentCount - 1 Do
+    GetCompiledDocs(Project, DocCount, UsePhysical);
+    For I := 0 To DocCount - 1 Do
     Begin
         If Count >= Limit Then Break;
-        Doc := Project.DM_LogicalDocuments(I);
+        Doc := GetCompiledDoc(Project, I, UsePhysical);
         If Doc = Nil Then Continue;
 
         For J := 0 To Doc.DM_ComponentCount - 1 Do
@@ -531,7 +581,8 @@ Var
     Doc : IDocument;
     Comp : IComponent;
     Pin : IPin;
-    I, J, K, Count, Limit : Integer;
+    I, J, K, Count, Limit, DocCount : Integer;
+    UsePhysical : Boolean;
     Data, CompDesig, CompComment, CompFP, CompLib, PinList : String;
     First, FirstPin : Boolean;
 Begin
@@ -552,10 +603,11 @@ Begin
     First := True;
     Count := 0;
 
-    For I := 0 To Project.DM_LogicalDocumentCount - 1 Do
+    GetCompiledDocs(Project, DocCount, UsePhysical);
+    For I := 0 To DocCount - 1 Do
     Begin
         If Count >= Limit Then Break;
-        Doc := Project.DM_LogicalDocuments(I);
+        Doc := GetCompiledDoc(Project, I, UsePhysical);
         If Doc = Nil Then Continue;
 
         For J := 0 To Doc.DM_ComponentCount - 1 Do
@@ -602,15 +654,33 @@ End;
 { Get full info for a single component (params + nets in one call)           }
 {..............................................................................}
 
+{ Proj_GetComponentInfo - one-shot inspection of a single component.         }
+{                                                                              }
+{ Pin nets are the ONLY field that needs a project compile, and a stale-     }
+{ cache compile on a multi-sheet hierarchical project can take 30-60s.       }
+{ Two opt-out flags let the caller skip the slow paths when the question     }
+{ doesn't need them:                                                          }
+{                                                                              }
+{   with_pin_nets=false  - skip SmartCompile, do not emit Pin.DM_FlattenedNet }
+{                          on each pin. Pin number/name still come back. The }
+{                          "looking up the part's value/footprint" case      }
+{                          becomes sub-second.                                }
+{   with_parameters=false - skip the parameter iterator on the live          }
+{                          component. Useful when only header metadata and  }
+{                          pins are needed.                                  }
+{                                                                              }
+{ Defaults are true for backward compatibility, so existing callers keep    }
+{ getting the full payload.                                                   }
 Function Proj_GetComponentInfo(Params : String; RequestId : String) : String;
 Var
-    ProjectPath, Designator : String;
+    ProjectPath, Designator, FlagStr : String;
     Workspace : IWorkspace;
     Project : IProject;
     Doc : IDocument;
     Comp : IComponent;
     Pin : IPin;
-    I, J, K : Integer;
+    I, J, K, DocCount : Integer;
+    UsePhysical, WithPinNets, WithParameters : Boolean;
     Data, PinList, ParamList : String;
     FirstPin, FirstParam : Boolean;
     Found : Boolean;
@@ -618,6 +688,11 @@ Begin
     ProjectPath := ExtractJsonValue(Params, 'project_path');
     ProjectPath := StringReplace(ProjectPath, '\\', '\', -1);
     Designator := ExtractJsonValue(Params, 'designator');
+
+    FlagStr := ExtractJsonValue(Params, 'with_pin_nets');
+    WithPinNets := (FlagStr <> 'false') And (FlagStr <> 'False') And (FlagStr <> '0');
+    FlagStr := ExtractJsonValue(Params, 'with_parameters');
+    WithParameters := (FlagStr <> 'false') And (FlagStr <> 'False') And (FlagStr <> '0');
 
     If Designator = '' Then Begin Result := BuildErrorResponse(RequestId, 'MISSING_PARAMS', 'designator is required'); Exit; End;
 
@@ -628,14 +703,35 @@ Begin
     Else Project := Workspace.DM_FocusedProject;
     If Project = Nil Then Begin Result := BuildErrorResponse(RequestId, 'NO_PROJECT', 'No project found'); Exit; End;
 
+    { Compile is only needed for Pin.DM_FlattenedNetName. force_recompile   }
+    { stays honoured even when nets are skipped, callers using it have an  }
+    { explicit reason to refresh the cache.                                 }
     ForceRecompileIfRequested(Project, Params);
-    SmartCompile(Project);
+    If WithPinNets Then SmartCompile(Project);
     Found := False;
 
-    For I := 0 To Project.DM_LogicalDocumentCount - 1 Do
+    { Physical-doc enumeration relies on the post-compile state. When we   }
+    { skipped the compile, walk logical docs instead, that's where the     }
+    { source-side metadata (designator, footprint, params, pin names)      }
+    { lives anyway.                                                         }
+    If WithPinNets Then
+        GetCompiledDocs(Project, DocCount, UsePhysical)
+    Else
+    Begin
+        DocCount := 0;
+        UsePhysical := False;
+        Try DocCount := Project.DM_LogicalDocumentCount; Except End;
+    End;
+    For I := 0 To DocCount - 1 Do
     Begin
         If Found Then Break;
-        Doc := Project.DM_LogicalDocuments(I);
+        If WithPinNets Then
+            Doc := GetCompiledDoc(Project, I, UsePhysical)
+        Else
+        Begin
+            Doc := Nil;
+            Try Doc := Project.DM_LogicalDocuments(I); Except End;
+        End;
         If Doc = Nil Then Continue;
 
         For J := 0 To Doc.DM_ComponentCount - 1 Do
@@ -646,7 +742,9 @@ Begin
 
             Found := True;
 
-            // Build pin list with nets
+            { Pin list. Net assignment skipped when WithPinNets is false,    }
+            { the field is omitted entirely so callers can tell "we didn't  }
+            { ask" from "no net assigned".                                   }
             PinList := '';
             FirstPin := True;
             For K := 0 To Comp.DM_PinCount - 1 Do
@@ -656,22 +754,29 @@ Begin
                 If Not FirstPin Then PinList := PinList + ',';
                 FirstPin := False;
                 PinList := PinList + '{"pin":"' + EscapeJsonString(Pin.DM_PinNumber) +
-                    '","name":"' + EscapeJsonString(Pin.DM_PinName) +
-                    '","net":"' + EscapeJsonString(Pin.DM_FlattenedNetName) + '"}';
+                    '","name":"' + EscapeJsonString(Pin.DM_PinName) + '"';
+                If WithPinNets Then
+                    PinList := PinList + ',"net":"' + EscapeJsonString(Pin.DM_FlattenedNetName) + '"';
+                PinList := PinList + '}';
             End;
 
-            // Build parameter list
+            { Parameter dict. Skipped when WithParameters is false, that   }
+            { iterator is moderate cost but unnecessary for "look up the  }
+            { footprint" / "look up the value" callers.                    }
             ParamList := '';
             FirstParam := True;
-            Try
-                For K := 0 To Comp.DM_ParameterCount - 1 Do
-                Begin
-                    If Not FirstParam Then ParamList := ParamList + ',';
-                    FirstParam := False;
-                    ParamList := ParamList + '"' + EscapeJsonString(Comp.DM_Parameters(K).DM_Name) +
-                        '":"' + EscapeJsonString(Comp.DM_Parameters(K).DM_Value) + '"';
+            If WithParameters Then
+            Begin
+                Try
+                    For K := 0 To Comp.DM_ParameterCount - 1 Do
+                    Begin
+                        If Not FirstParam Then ParamList := ParamList + ',';
+                        FirstParam := False;
+                        ParamList := ParamList + '"' + EscapeJsonString(Comp.DM_Parameters(K).DM_Name) +
+                            '":"' + EscapeJsonString(Comp.DM_Parameters(K).DM_Value) + '"';
+                    End;
+                Except
                 End;
-            Except
             End;
 
             Data := '{"designator":"' + EscapeJsonString(Designator) + '"';
@@ -679,7 +784,8 @@ Begin
             Data := Data + ',"footprint":"' + EscapeJsonString(Comp.DM_Footprint) + '"';
             Data := Data + ',"lib_ref":"' + EscapeJsonString(Comp.DM_LibraryReference) + '"';
             Data := Data + ',"sheet":"' + EscapeJsonString(Doc.DM_FileName) + '"';
-            Data := Data + ',"parameters":{' + ParamList + '}';
+            If WithParameters Then
+                Data := Data + ',"parameters":{' + ParamList + '}';
             Data := Data + ',"pins":[' + PinList + ']}';
 
             Result := BuildSuccessResponse(RequestId, Data);
@@ -800,7 +906,7 @@ Begin
 End;
 
 {..............................................................................}
-{ PCB board info — outline, layer stack, origin                              }
+{ PCB board info, outline, layer stack, origin                              }
 {..............................................................................}
 
 Function Proj_GetBoardInfo(Params : String; RequestId : String) : String;
@@ -866,7 +972,7 @@ Begin
 End;
 
 {..............................................................................}
-{ Annotate schematic designators — programmatic, no dialog                    }
+{ Annotate schematic designators, programmatic, no dialog                    }
 {                                                                              }
 { Strategy:                                                                    }
 { - For each SCH doc in the focused/specified project, iterate components.    }
@@ -915,7 +1021,7 @@ Function CompareAnnotationOrder(Order : String;
     BX, BY, BDocIdx : Integer) : Integer;
 Begin
     Result := 0;
-    { Doc index is the primary tie-breaker — keep designators contiguous per sheet }
+    { Doc index is the primary tie-breaker, keep designators contiguous per sheet }
     If ADocIdx < BDocIdx Then Begin Result := -1; Exit; End;
     If ADocIdx > BDocIdx Then Begin Result :=  1; Exit; End;
 
@@ -970,9 +1076,9 @@ Var
     RenameCount, ResetCount, SkipCount, ProcessedDocs : Integer;
     FilePath : String;
 
-    { Flat parallel arrays — one slot per unlocked, considered component.
+    { Flat parallel arrays, one slot per unlocked, considered component.
       Interfaces go in a TInterfaceList; sort keys go in parallel TStringList
-      (DelphiScript-friendly approach — TStringList.Objects[] with interface
+      (DelphiScript-friendly approach, TStringList.Objects[] with interface
       pointers is unreliable). }
     CompList   : TInterfaceList;
     Prefixes   : TStringList;
@@ -980,10 +1086,10 @@ Var
     YCoords    : TStringList;  { Y in mils as integer-string }
     DocIndices : TStringList;
 
-    { Set of modified docs — PreProcess/PostProcess/Invalidate are scoped to these only }
+    { Set of modified docs, PreProcess/PostProcess/Invalidate are scoped to these only }
     TouchedDocs : TStringList;
 
-    { Per-prefix counter for final assignment — stored as "Prefix=N" lines }
+    { Per-prefix counter for final assignment, stored as "Prefix=N" lines }
     PrefixCounters : TStringList;
     PrefixIdx, CounterVal : Integer;
     N : Integer;
@@ -1038,7 +1144,7 @@ Begin
 
             FilePath := Doc.DM_FullPath;
 
-            { Don't force-open — RunProcess Client:OpenDocument strips
+            { Don't force-open, RunProcess Client:OpenDocument strips
               project association and creates a free document in the UI.
               Skip sheets that aren't currently loaded. }
             SchDoc := SchServer.GetSchDocumentByPath(FilePath);
@@ -1075,7 +1181,7 @@ Begin
                 Finally
                     SchDoc.SchIterator_Destroy(Iterator);
                 End;
-                SchServer.ProcessControl.PostProcess(SchDoc, '');
+                SchServer.ProcessControl.PostProcess(SchDoc, 'Edit');
                 SchDoc.GraphicallyInvalidate;
                 SaveDocByPath(FilePath);
                 Continue;
@@ -1209,14 +1315,14 @@ Begin
             SchDoc := SchServer.GetSchDocumentByPath(TouchedDocs[I]);
             If SchDoc <> Nil Then
             Begin
-                SchServer.ProcessControl.PostProcess(SchDoc, '');
+                SchServer.ProcessControl.PostProcess(SchDoc, 'Edit');
                 SchDoc.GraphicallyInvalidate;
             End;
             SaveDocByPath(TouchedDocs[I]);
         End;
 
     Finally
-        { TInterfaceList owns its interface references — Free to release them }
+        { TInterfaceList owns its interface references, Free to release them }
         CompList.Free;
         Prefixes.Free;
         XCoords.Free;
@@ -1282,7 +1388,7 @@ End;
 
 {..............................................................................}
 { Export PCB to STEP 3D model                                                 }
-{ Params: output_path (optional — if omitted, Altium may prompt)              }
+{ Params: output_path (optional, if omitted, Altium may prompt)              }
 {..............................................................................}
 
 Function Proj_ExportSTEP(Params : String; RequestId : String) : String;
@@ -1362,8 +1468,8 @@ End;
 
 {..............................................................................}
 { List output containers from an open .OutJob document                        }
-{ The OutJob file is an INI format — parse sections for containers.           }
-{ Params: outjob_path (optional — uses first open OutJob if omitted)          }
+{ The OutJob file is an INI format, parse sections for containers.           }
+{ Params: outjob_path (optional, uses first open OutJob if omitted)          }
 {..............................................................................}
 
 Function Proj_GetOutJobContainers(Params : String; RequestId : String) : String;
@@ -1417,7 +1523,7 @@ Begin
         Exit;
     End;
 
-    { OutJob files are INI format — parse OutputGroup sections }
+    { OutJob files are INI format, parse OutputGroup sections }
     Data := '[';
     First := True;
     IniFile := TIniFile.Create(OutJobPath);
@@ -1646,7 +1752,7 @@ Begin
             If Not FirstComp Then VarInfo := VarInfo + ',';
             FirstComp := False;
 
-            { Translate variation kind to string (If/Else chain — Case on enum crashes DelphiScript) }
+            { Translate variation kind to string (If/Else chain, Case on enum crashes DelphiScript) }
             If CompVar.DM_VariationKind = 0 Then
                 KindStr := 'Fitted'
             Else If CompVar.DM_VariationKind = 1 Then
@@ -2024,7 +2130,8 @@ Var
     Doc : IDocument;
     Comp : IComponent;
     Pin : IPin;
-    I, J, K : Integer;
+    I, J, K, DocCount : Integer;
+    UsePhysical : Boolean;
     Data, PinList : String;
     FirstPin, Found : Boolean;
 Begin
@@ -2045,10 +2152,11 @@ Begin
     SmartCompile(Project);
     Found := False;
 
-    For I := 0 To Project.DM_LogicalDocumentCount - 1 Do
+    GetCompiledDocs(Project, DocCount, UsePhysical);
+    For I := 0 To DocCount - 1 Do
     Begin
         If Found Then Break;
-        Doc := Project.DM_LogicalDocuments(I);
+        Doc := GetCompiledDoc(Project, I, UsePhysical);
         If Doc = Nil Then Continue;
 
         For J := 0 To Doc.DM_ComponentCount - 1 Do
@@ -2101,6 +2209,8 @@ End;
 {..............................................................................}
 
 Function Proj_GetConnectivityBatch(Params : String; RequestId : String) : String;
+Const
+    MaxWanted = 500;
 Var
     ProjectPath, DesigStr, Remaining : String;
     Workspace : IWorkspace;
@@ -2108,7 +2218,8 @@ Var
     Doc : IDocument;
     Comp : IComponent;
     Pin : IPin;
-    I, J, K, N : Integer;
+    I, J, K, N, DocCount : Integer;
+    UsePhysical : Boolean;
     Data, PinList, CompEntry, NotFoundJson, ThisDesig : String;
     FirstPin, FirstC, FirstNF, Matched : Boolean;
     Wanted : Array[0..499] Of String;
@@ -2126,7 +2237,7 @@ Begin
     End;
 
     { Pre-scan DesigStr into the Wanted / Found arrays using the cursor }
-    { helper — we need random-access to the full list to track "not     }
+    { helper, we need random-access to the full list to track "not     }
     { found" after the iteration below.                                 }
     WantedCount := 0;
     Remaining := DesigStr;
@@ -2134,7 +2245,7 @@ Begin
     Begin
         ThisDesig := NextBatchOp(Remaining);
         If ThisDesig = '' Then Break;
-        If WantedCount > High(Wanted) Then Break;
+        If WantedCount >= MaxWanted Then Break;
         Wanted[WantedCount] := ThisDesig;
         Found[WantedCount] := False;
         WantedCount := WantedCount + 1;
@@ -2166,9 +2277,10 @@ Begin
     FirstC := True;
     MatchCount := 0;
 
-    For I := 0 To Project.DM_LogicalDocumentCount - 1 Do
+    GetCompiledDocs(Project, DocCount, UsePhysical);
+    For I := 0 To DocCount - 1 Do
     Begin
-        Doc := Project.DM_LogicalDocuments(I);
+        Doc := GetCompiledDoc(Project, I, UsePhysical);
         If Doc = Nil Then Continue;
 
         For J := 0 To Doc.DM_ComponentCount - 1 Do
@@ -2398,7 +2510,7 @@ Begin
             SchRegisterObject(SchDoc, Parameter);
         End;
     Finally
-        SchServer.ProcessControl.PostProcess(SchDoc, '');
+        SchServer.ProcessControl.PostProcess(SchDoc, 'Edit');
     End;
 
     { Persist directly to disk via the IServerDocument API. SaveDocByPath
@@ -2519,7 +2631,7 @@ End;
 { Push schematic changes to PCB (Design > Update PCB Document).               }
 {                                                                              }
 { Altium does not expose a fully documented DelphiScript API for silently      }
-{ executing an ECO — the IEngineeringChangeOrder / IECOManager interfaces     }
+{ executing an ECO, the IEngineeringChangeOrder / IECOManager interfaces     }
 { are not reachable from scripting in any publicly documented way.             }
 {                                                                              }
 { Strategy:                                                                    }
@@ -2527,7 +2639,7 @@ End;
 {      counts are available regardless of what the ECO dialog does.            }
 {   2. Invoke PCB:UpdatePCBFromProject with parameter flags (DisableDialog,   }
 {      Silent, Execute, NoConfirm, AutoApply) that various Altium builds      }
-{      honor — older builds ignore unknown flags but do not error. Modern     }
+{      honor, older builds ignore unknown flags but do not error. Modern     }
 {      builds (AD20+) honor DisableDialog=True by applying changes            }
 {      automatically in many cases.                                           }
 {   3. Re-compile and recompute mappings; report the before/after delta.      }
@@ -2823,7 +2935,7 @@ Begin
     End;
     SchDoc.SchIterator_Destroy(Iterator);
 
-    SchServer.ProcessControl.PostProcess(SchDoc, '');
+    SchServer.ProcessControl.PostProcess(SchDoc, 'Edit');
     SchDoc.GraphicallyInvalidate;
 
     Result := BuildSuccessResponse(RequestId,
@@ -2864,7 +2976,7 @@ Begin
         Data := Data + ',"output_path":""';
     End;
 
-    { Hierarchy mode (If/Else chain — Case on enum crashes DelphiScript) }
+    { Hierarchy mode (If/Else chain, Case on enum crashes DelphiScript) }
     Try
         If Project.DM_HierarchyMode = 0 Then
             HierMode := 'Flat'
@@ -2923,7 +3035,7 @@ End;
 { sheets actually resident in SchServer. A sheet is listed as a project member  }
 { via DM_LogicalDocuments even when Altium hasn't loaded its editor state yet.  }
 { This handler walks every project sheet and, for any that aren't loaded, calls }
-{ Client.OpenDocument('SCH', path) — the same API set_document_parameter has    }
+{ Client.OpenDocument('SCH', path), the same API set_document_parameter has    }
 { used without creating free documents. RunProcess('Client:OpenDocument') would }
 { strip project membership and produce free docs; do not substitute it.         }
 {..............................................................................}

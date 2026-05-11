@@ -103,7 +103,7 @@ Begin
     Count := 0;
 
     { MemberCount / MemberName[] are not exposed on IPCB_ObjectClass in         }
-    { DelphiScript — they are compile-time undeclared. Return class metadata   }
+    { DelphiScript, they are compile-time undeclared. Return class metadata   }
     { only; callers that need per-member resolution can iterate nets and       }
     { group them via the parent class on each net.                              }
     Iterator := Board.BoardIterator_Create;
@@ -312,19 +312,27 @@ Begin
 End;
 
 {..............................................................................}
-{ PCB_GetRuleProperties - Read kind-specific properties of a design rule.       }
+{ PCB_GetRuleProperties - Read properties of a design rule.                     }
 {                                                                               }
-{ IPCB_Rule is declared with a union of all rule-kind properties (Gap for       }
-{ clearance, MinWidth[L] for width, MinLimit / MaxLimit / MinHoleSize /         }
-{ MaxHoleSize / Impedance, ...). Reading a property that doesn't apply to the   }
-{ rule's actual kind raises at runtime; Try/Except skips those silently.        }
+{ Constraint values (Gap, MinWidth, MinHoleSize, impedance, etc.) are NOT       }
+{ properties of the base IPCB_Rule interface, they live on the per-kind        }
+{ subtypes (IPCB_ClearanceConstraint, IPCB_MaxMinWidthConstraint, etc.). The    }
+{ kind-specific Pascal constants are not declared in every Altium build, so     }
+{ accessing them directly compiles in some versions and crashes others with     }
+{ "Undeclared identifier" errors that Try/Except cannot catch.                  }
+{                                                                               }
+{ Rule.Descriptor is a stable, documented string property on every IPCB_Rule    }
+{ subtype that already contains all constraint values in human-readable form,   }
+{ e.g. "Width Constraint (Min=0.18mm) (Max=0.19mm) (Preferred=0.185mm)".        }
+{ Callers that need parsed values can split the descriptor, far safer than    }
+{ dispatching on RuleKind to typed subtype access in script.                    }
 {..............................................................................}
 
 Function PCB_GetRuleProperties(Params : String; RequestId : String) : String;
 Var
     Board : IPCB_Board;
     Rule : IPCB_Rule;
-    RuleName, JsonProps : String;
+    RuleName : String;
 Begin
     Board := GetPCBBoardAnywhere;
     If Board = Nil Then
@@ -347,58 +355,61 @@ Begin
         Exit;
     End;
 
-    JsonProps := '';
-
-    { Clearance rules — Gap is the minimum clearance in internal coord units. }
-    Try JsonProps := JsonProps + ',"gap_mils":' + IntToStr(CoordToMils(Rule.Gap)); Except End;
-
-    { Width rules — per-layer min/max/favored. Emit the top-layer value as a  }
-    { representative; full per-layer readback is rarely useful in practice.   }
-    Try JsonProps := JsonProps + ',"min_width_mils":' + IntToStr(CoordToMils(Rule.MinWidth[eTopLayer])); Except End;
-    Try JsonProps := JsonProps + ',"max_width_mils":' + IntToStr(CoordToMils(Rule.MaxWidth[eTopLayer])); Except End;
-    Try JsonProps := JsonProps + ',"preferred_width_mils":' + IntToStr(CoordToMils(Rule.FavoredWidth[eTopLayer])); Except End;
-
-    { Generic MinLimit / MaxLimit — hole size, via size, flight time limit.   }
-    Try JsonProps := JsonProps + ',"min_limit_mils":' + IntToStr(CoordToMils(Rule.MinLimit)); Except End;
-    Try JsonProps := JsonProps + ',"max_limit_mils":' + IntToStr(CoordToMils(Rule.MaxLimit)); Except End;
-
-    { Via size — hole and diameter. }
-    Try JsonProps := JsonProps + ',"min_hole_size_mils":' + IntToStr(CoordToMils(Rule.MinHoleSize)); Except End;
-    Try JsonProps := JsonProps + ',"max_hole_size_mils":' + IntToStr(CoordToMils(Rule.MaxHoleSize)); Except End;
-    Try JsonProps := JsonProps + ',"preferred_hole_size_mils":' + IntToStr(CoordToMils(Rule.PreferredHoleSize)); Except End;
-    Try JsonProps := JsonProps + ',"min_width_via_mils":' + IntToStr(CoordToMils(Rule.MinWidth)); Except End;
-    Try JsonProps := JsonProps + ',"max_width_via_mils":' + IntToStr(CoordToMils(Rule.MaxWidth)); Except End;
-    Try JsonProps := JsonProps + ',"preferred_width_via_mils":' + IntToStr(CoordToMils(Rule.PreferredWidth)); Except End;
-
-    { Parallel segment / daisy chain stub — Limit is already a coord. }
-    Try JsonProps := JsonProps + ',"parallel_limit_mils":' + IntToStr(CoordToMils(Rule.ParallelLimit)); Except End;
-    Try JsonProps := JsonProps + ',"parallel_gap_mils":' + IntToStr(CoordToMils(Rule.ParallelGap)); Except End;
-
-    { Max/min impedance — no coord units, floating-point ohms.                  }
-    Try JsonProps := JsonProps + ',"min_impedance":' + FloatToStr(Rule.MinImpedance); Except End;
-    Try JsonProps := JsonProps + ',"max_impedance":' + FloatToStr(Rule.MaxImpedance); Except End;
-    Try JsonProps := JsonProps + ',"preferred_impedance":' + FloatToStr(Rule.PreferredImpedance); Except End;
-
     Result := BuildSuccessResponse(RequestId,
         '{"name":"' + EscapeJsonString(Rule.Name) + '",'
         + '"rule_kind":' + IntToStr(Rule.RuleKind) + ','
         + '"enabled":' + BoolToJsonStr(Rule.Enabled) + ','
-        + '"priority":' + IntToStr(Rule.Priority)
-        + JsonProps + '}');
+        + '"priority":' + IntToStr(Rule.Priority) + ','
+        + '"descriptor":"' + EscapeJsonString(Rule.Descriptor) + '"}');
 End;
 
 {..............................................................................}
-{ PCB_SetRuleProperties - Update kind-specific properties of a design rule.     }
-{ Params: name + any of the keys PCB_GetRuleProperties returns.                 }
+{ PCB_SetRuleProperties - Update metadata + constraint values of a rule.        }
+{                                                                               }
+{ Metadata params (writable on the base IPCB_Rule reference):                   }
+{   enabled / scope1 / scope2 / comment                                          }
+{                                                                               }
+{ Priority is INTENTIONALLY not writable through this tool. Per the PCB API     }
+{ reference (pcb-api-design-objects-interfaces-reference.html:15331), IPCB_Rule }
+{ exposes `Function Priority : TRulePrecedence` as a read-only METHOD, not as   }
+{ a writable property. Assigning `Rule.Priority := N` against that function-   }
+{ kind property reference crashes the script engine at runtime with an         }
+{ unreadable error popup. There is no SetState_Priority / SetPriority method   }
+{ in the public SDK either. To change a rule's priority, use Altium's UI       }
+{ (PCB > Rules and Constraints Editor, drag-reorder the rule in its category). }
+{                                                                               }
+{ Constraint params (dispatched by Rule.RuleKind, written through typed        }
+{ iterator-returned locals per the ModifyWidthRules.pas reference pattern):    }
+{   - Clearance (kind 0) + ComponentClearance (kind 24)                        }
+{     + HoleToHoleClearance (kind 52):  gap_mils                                }
+{   - MaxMinWidth (kind 2):  min_width_mils / max_width_mils / favored_width_mils}
+{   - MaxMinHoleSize (kind 42):  min_hole_size_mils / max_hole_size_mils       }
+{                                                                               }
+{ Empirically determined kind 52 from the runtime rule list; the published     }
+{ TRuleKind enum stops at 51 (DifferentialPairsRouting). Kinds 52+ are newer   }
+{ Altium rule kinds that share the IPCB_ClearanceConstraint interface.         }
+{                                                                               }
+{ The cast `TypedLocal := UntypedLocal` (e.g. RuleWidth := Rule) does NOT       }
+{ narrow the interface at runtime in DelphiScript, the typed variable keeps   }
+{ behaving like the source IPCB_Rule and constraint-only property writes      }
+{ crash the engine. The proven write path declares the typed variable AS the }
+{ iterator-result type and assigns directly from BoardIterator.FirstPCBObject,}
+{ where DelphiScript does narrow. See delphiscript_interface_narrowing.md     }
+{ in user memory for details.                                                  }
 {..............................................................................}
 
 Function PCB_SetRuleProperties(Params : String; RequestId : String) : String;
 Var
     Board : IPCB_Board;
     Rule : IPCB_Rule;
-    RuleName, V : String;
+    Iter : IPCB_BoardIterator;
+    RuleClearIter : IPCB_ClearanceConstraint;
+    RuleWidthIter : IPCB_MaxMinWidthConstraint;
+    RuleHoleIter : IPCB_MaxMinHoleSizeConstraint;
+    RuleName, V, GapStr, MinWStr, MaxWStr, FavWStr, MinHStr, MaxHStr : String;
+    UpdatedCount, Kind, ValMils : Integer;
     L : TLayer;
-    UpdatedCount : Integer;
+    Found : Boolean;
 Begin
     Board := GetPCBBoardAnywhere;
     If Board = Nil Then
@@ -422,6 +433,12 @@ Begin
     End;
 
     UpdatedCount := 0;
+    Kind := 0;
+    Try Kind := Rule.RuleKind; Except End;
+
+    { -- Metadata path: writes against the base IPCB_Rule. priority is NOT    }
+    { included, it is a read-only function and writing to it crashes the      }
+    { engine. See the docstring above for details.                            }
     PCBServer.PreProcess;
     Try
         PCBServer.SendMessageToRobots(Rule.I_ObjectAddress, c_Broadcast,
@@ -431,90 +448,6 @@ Begin
         If V <> '' Then
         Begin
             Try Rule.Enabled := (V = 'true') Or (V = 'True') Or (V = '1'); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'priority');
-        If V <> '' Then
-        Begin
-            Try Rule.Priority := StrToIntDef(V, Rule.Priority); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'gap_mils');
-        If V <> '' Then
-        Begin
-            Try Rule.Gap := MilsToCoord(StrToIntDef(V, 0)); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'min_width_mils');
-        If V <> '' Then
-        Begin
-            For L := MinLayer To MaxLayer Do
-                Try Rule.MinWidth[L] := MilsToCoord(StrToIntDef(V, 0)); Except End;
-            Inc(UpdatedCount);
-        End;
-
-        V := ExtractJsonValue(Params, 'max_width_mils');
-        If V <> '' Then
-        Begin
-            For L := MinLayer To MaxLayer Do
-                Try Rule.MaxWidth[L] := MilsToCoord(StrToIntDef(V, 0)); Except End;
-            Inc(UpdatedCount);
-        End;
-
-        V := ExtractJsonValue(Params, 'preferred_width_mils');
-        If V <> '' Then
-        Begin
-            For L := MinLayer To MaxLayer Do
-                Try Rule.FavoredWidth[L] := MilsToCoord(StrToIntDef(V, 0)); Except End;
-            Inc(UpdatedCount);
-        End;
-
-        V := ExtractJsonValue(Params, 'min_limit_mils');
-        If V <> '' Then
-        Begin
-            Try Rule.MinLimit := MilsToCoord(StrToIntDef(V, 0)); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'max_limit_mils');
-        If V <> '' Then
-        Begin
-            Try Rule.MaxLimit := MilsToCoord(StrToIntDef(V, 0)); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'min_hole_size_mils');
-        If V <> '' Then
-        Begin
-            Try Rule.MinHoleSize := MilsToCoord(StrToIntDef(V, 0)); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'max_hole_size_mils');
-        If V <> '' Then
-        Begin
-            Try Rule.MaxHoleSize := MilsToCoord(StrToIntDef(V, 0)); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'preferred_hole_size_mils');
-        If V <> '' Then
-        Begin
-            Try Rule.PreferredHoleSize := MilsToCoord(StrToIntDef(V, 0)); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'min_impedance');
-        If V <> '' Then
-        Begin
-            Try Rule.MinImpedance := StrToFloatDef(V, 0); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'max_impedance');
-        If V <> '' Then
-        Begin
-            Try Rule.MaxImpedance := StrToFloatDef(V, 0); Inc(UpdatedCount); Except End;
-        End;
-
-        V := ExtractJsonValue(Params, 'preferred_impedance');
-        If V <> '' Then
-        Begin
-            Try Rule.PreferredImpedance := StrToFloatDef(V, 0); Inc(UpdatedCount); Except End;
         End;
 
         V := ExtractJsonValue(Params, 'scope1');
@@ -541,10 +474,132 @@ Begin
         PCBServer.PostProcess;
     End;
 
+    { -- Constraint values: per-kind iterator with typed iterator-returned    }
+    { locals. Each block opens its own BoardIterator, walks rule objects,    }
+    { matches by name + kind, applies the write, breaks out. See the         }
+    { ModifyWidthRules.pas reference pattern.                                  }
+    GapStr := ExtractJsonValue(Params, 'gap_mils');
+    MinWStr := ExtractJsonValue(Params, 'min_width_mils');
+    MaxWStr := ExtractJsonValue(Params, 'max_width_mils');
+    FavWStr := ExtractJsonValue(Params, 'favored_width_mils');
+    MinHStr := ExtractJsonValue(Params, 'min_hole_size_mils');
+    MaxHStr := ExtractJsonValue(Params, 'max_hole_size_mils');
+
+    If (GapStr <> '') And
+       ((Kind = eRule_Clearance) Or (Kind = 24) Or (Kind = 52)) Then
+    Begin
+        Iter := Board.BoardIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eRuleObject));
+        Iter.AddFilter_LayerSet(AllLayers);
+        Iter.AddFilter_Method(eProcessAll);
+        Found := False;
+        Try
+            RuleClearIter := Iter.FirstPCBObject;
+            While (RuleClearIter <> Nil) And (Not Found) Do
+            Begin
+                If RuleClearIter.Name = RuleName Then
+                Begin
+                    Try
+                        RuleClearIter.Gap := MilsToCoord(StrToIntDef(GapStr, 0));
+                        Inc(UpdatedCount);
+                    Except End;
+                    Found := True;
+                End;
+                If Not Found Then RuleClearIter := Iter.NextPCBObject;
+            End;
+        Finally
+            Board.BoardIterator_Destroy(Iter);
+        End;
+    End;
+
+    If (Kind = eRule_MaxMinWidth) And
+       ((MinWStr <> '') Or (MaxWStr <> '') Or (FavWStr <> '')) Then
+    Begin
+        Iter := Board.BoardIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eRuleObject));
+        Iter.AddFilter_LayerSet(AllLayers);
+        Iter.AddFilter_Method(eProcessAll);
+        Found := False;
+        Try
+            RuleWidthIter := Iter.FirstPCBObject;
+            While (RuleWidthIter <> Nil) And (Not Found) Do
+            Begin
+                If (RuleWidthIter.RuleKind = eRule_MaxMinWidth)
+                    And (RuleWidthIter.Name = RuleName) Then
+                Begin
+                    If MinWStr <> '' Then
+                    Begin
+                        ValMils := StrToIntDef(MinWStr, 0);
+                        Try
+                            For L := MinLayer To MaxLayer Do
+                                RuleWidthIter.MinWidth(L) := MilsToCoord(ValMils);
+                            Inc(UpdatedCount);
+                        Except End;
+                    End;
+                    If MaxWStr <> '' Then
+                    Begin
+                        ValMils := StrToIntDef(MaxWStr, 0);
+                        Try
+                            For L := MinLayer To MaxLayer Do
+                                RuleWidthIter.MaxWidth(L) := MilsToCoord(ValMils);
+                            Inc(UpdatedCount);
+                        Except End;
+                    End;
+                    If FavWStr <> '' Then
+                    Begin
+                        ValMils := StrToIntDef(FavWStr, 0);
+                        Try
+                            For L := MinLayer To MaxLayer Do
+                                RuleWidthIter.FavoredWidth(L) := MilsToCoord(ValMils);
+                            Inc(UpdatedCount);
+                        Except End;
+                    End;
+                    Found := True;
+                End;
+                If Not Found Then RuleWidthIter := Iter.NextPCBObject;
+            End;
+        Finally
+            Board.BoardIterator_Destroy(Iter);
+        End;
+    End;
+
+    If (Kind = eRule_MaxMinHoleSize) And
+       ((MinHStr <> '') Or (MaxHStr <> '')) Then
+    Begin
+        Iter := Board.BoardIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eRuleObject));
+        Iter.AddFilter_LayerSet(AllLayers);
+        Iter.AddFilter_Method(eProcessAll);
+        Found := False;
+        Try
+            RuleHoleIter := Iter.FirstPCBObject;
+            While (RuleHoleIter <> Nil) And (Not Found) Do
+            Begin
+                If (RuleHoleIter.RuleKind = eRule_MaxMinHoleSize)
+                    And (RuleHoleIter.Name = RuleName) Then
+                Begin
+                    If MinHStr <> '' Then
+                    Begin
+                        Try RuleHoleIter.MinLimit := MilsToCoord(StrToIntDef(MinHStr, 0)); Inc(UpdatedCount); Except End;
+                    End;
+                    If MaxHStr <> '' Then
+                    Begin
+                        Try RuleHoleIter.MaxLimit := MilsToCoord(StrToIntDef(MaxHStr, 0)); Inc(UpdatedCount); Except End;
+                    End;
+                    Found := True;
+                End;
+                If Not Found Then RuleHoleIter := Iter.NextPCBObject;
+            End;
+        Finally
+            Board.BoardIterator_Destroy(Iter);
+        End;
+    End;
+
     SaveDocByPath(Board.FileName);
 
     Result := BuildSuccessResponse(RequestId,
         '{"name":"' + EscapeJsonString(Rule.Name) + '",'
+        + '"rule_kind":' + IntToStr(Kind) + ','
         + '"properties_updated":' + IntToStr(UpdatedCount) + '}');
 End;
 
@@ -664,14 +719,14 @@ Begin
 
         // Note: IPCB_Component.Locked is undeclared in DelphiScript despite
         // being documented. Try/Except does not catch compile-time undeclared
-        // identifiers — assigning to Comp.Locked crashes the whole script.
+        // identifiers, assigning to Comp.Locked crashes the whole script.
         // Skipped for now; if a future build exposes it, add it back.
 
         JsonItems := JsonItems + '{"designator":"' + EscapeJsonString(Designator) + '",'
             + '"comment":"' + EscapeJsonString(CommentStr) + '",'
             + '"x":' + IntToStr(CoordToMils(Comp.x)) + ','
             + '"y":' + IntToStr(CoordToMils(Comp.y)) + ','
-            + '"rotation":' + FloatToStr(Comp.Rotation) + ','
+            + '"rotation":' + FloatToJsonStr(Comp.Rotation) + ','
             + '"layer":"' + EscapeJsonString(LayerStr) + '",'
             + '"footprint":"' + EscapeJsonString(Footprint) + '",'
             + '"source_designator":"' + EscapeJsonString(SrcDesignator) + '",'
@@ -733,7 +788,11 @@ Begin
     If HasY Then NewY := StrToIntDef(YStr, 0);
     If HasRot Then NewRot := StrToFloatDef(RotStr, 0);
 
-    // Modify the component
+    { Comp.X / Comp.Y are inherited writable properties from IPCB_Group     }
+    { (Component's parent, per ref line 3887: "the X,Y fields inherited from }
+    { IPCB_Group interface"). Direct assignment is the documented API. The   }
+    { previous OleStr->Double crash was the locale-dependent StrToFloat in   }
+    { the rotation path; fixed in Utils.pas StrToFloatDef.                    }
     PCBServer.PreProcess;
     Try
         PCBServer.SendMessageToRobots(Comp.I_ObjectAddress, c_Broadcast,
@@ -755,7 +814,7 @@ Begin
         '{"designator":"' + EscapeJsonString(DesStr) + '",'
         + '"x":' + IntToStr(CoordToMils(Comp.x)) + ','
         + '"y":' + IntToStr(CoordToMils(Comp.y)) + ','
-        + '"rotation":' + FloatToStr(Comp.Rotation) + '}');
+        + '"rotation":' + FloatToJsonStr(Comp.Rotation) + '}');
 End;
 
 {..............................................................................}
@@ -917,7 +976,7 @@ Begin
     FilterNet := ExtractJsonValue(Params, 'net');
     NetCount := 0;
 
-    // Include tracks AND arcs — routed nets use both. Arc length =
+    // Include tracks AND arcs, routed nets use both. Arc length =
     // radius * sweepAngle(radians). AnglesRange is SweepAngle for
     // IPCB_Arc (StartAngle/EndAngle also available but sweep is the
     // pre-computed arc extent in degrees).
@@ -992,7 +1051,7 @@ Begin
         If Not First Then JsonItems := JsonItems + ',';
         First := False;
         JsonItems := JsonItems + '{"net":"' + EscapeJsonString(NetNames[I]) + '",'
-            + '"length_mils":' + FloatToStr(NetLengths[I]) + '}';
+            + '"length_mils":' + FloatToJsonStr(NetLengths[I]) + '}';
     End;
 
     Result := BuildSuccessResponse(RequestId,
@@ -1062,10 +1121,10 @@ Begin
 
         JsonItems := JsonItems + '{"name":"' + EscapeJsonString(LayerName) + '",'
             + '"order":' + IntToStr(Count + 1) + ','
-            + '"copper_thickness_mils":' + FloatToStr(CopperThickMils) + ','
+            + '"copper_thickness_mils":' + FloatToJsonStr(CopperThickMils) + ','
             + '"dielectric_type":"' + EscapeJsonString(DielectricType) + '",'
-            + '"dielectric_height_mils":' + FloatToStr(DielectricHeightMils) + ','
-            + '"dielectric_constant":' + FloatToStr(DielectricConst) + '}';
+            + '"dielectric_height_mils":' + FloatToJsonStr(DielectricHeightMils) + ','
+            + '"dielectric_constant":' + FloatToJsonStr(DielectricConst) + '}';
         Inc(Count);
         LayerObj := LayerStack.NextLayer(LayerObj);
     End;
@@ -1352,8 +1411,8 @@ Begin
             JsonItems := JsonItems + ','
                 + '"cx":' + IntToStr(CoordToMils(Outline.Segments[I].cx)) + ','
                 + '"cy":' + IntToStr(CoordToMils(Outline.Segments[I].cy)) + ','
-                + '"angle1":' + FloatToStr(Outline.Segments[I].Angle1) + ','
-                + '"angle2":' + FloatToStr(Outline.Segments[I].Angle2);
+                + '"angle1":' + FloatToJsonStr(Outline.Segments[I].Angle1) + ','
+                + '"angle2":' + FloatToJsonStr(Outline.Segments[I].Angle2);
         End;
 
         JsonItems := JsonItems + '}';
@@ -1444,7 +1503,7 @@ Begin
     Board.LayerIsDisplayed[LayerID] := Visible;
 
     // Refresh the view
-    // Board.ViewManager_FullUpdate;  // removed — expensive on large boards; Altium auto-refreshes on user interaction
+    // Board.ViewManager_FullUpdate;  // removed, expensive on large boards; Altium auto-refreshes on user interaction
 
     Result := BuildSuccessResponse(RequestId,
         '{"layer":"' + EscapeJsonString(LayerStr) + '",'
@@ -1469,7 +1528,7 @@ Begin
     ResetParameters;
     RunProcess('PCB:RepourAllPolygons');
 
-    // Board.ViewManager_FullUpdate;  // removed — expensive on large boards; Altium auto-refreshes on user interaction
+    // Board.ViewManager_FullUpdate;  // removed, expensive on large boards; Altium auto-refreshes on user interaction
 
     Result := BuildSuccessResponse(RequestId,
         '{"repoured":true}');
@@ -1767,7 +1826,7 @@ Begin
         { Broadcast ONCE at the end of the batch instead of once per track.   }
         { A single BoardRegisteration on the board object (null child) is     }
         { enough to kick the connectivity/rules engines to refresh the whole  }
-        { board — much cheaper than N individual broadcasts.                   }
+        { board, much cheaper than N individual broadcasts.                   }
         PCBServer.SendMessageToRobots(Board.I_ObjectAddress, c_Broadcast,
             PCBM_BoardRegisteration, c_NoEventData);
     Finally
@@ -1859,8 +1918,8 @@ Begin
         + '"x_center":' + IntToStr(ArcXC) + ','
         + '"y_center":' + IntToStr(ArcYC) + ','
         + '"radius":' + IntToStr(ArcRad) + ','
-        + '"start_angle":' + FloatToStr(ArcSA) + ','
-        + '"end_angle":' + FloatToStr(ArcEA) + ','
+        + '"start_angle":' + FloatToJsonStr(ArcSA) + ','
+        + '"end_angle":' + FloatToJsonStr(ArcEA) + ','
         + '"width":' + IntToStr(ArcWidth) + ','
         + '"layer":"' + EscapeJsonString(GetLayerString(Arc.Layer)) + '"}');
 End;
@@ -1946,7 +2005,7 @@ Begin
         + '"x":' + IntToStr(TX) + ','
         + '"y":' + IntToStr(TY) + ','
         + '"height":' + IntToStr(THeight) + ','
-        + '"rotation":' + FloatToStr(TRot) + ','
+        + '"rotation":' + FloatToJsonStr(TRot) + ','
         + '"layer":"' + EscapeJsonString(GetLayerString(TextObj.Layer)) + '"}');
 End;
 
@@ -2063,13 +2122,13 @@ Begin
         AddStringParameter('Net', NetStr);
     RunProcess('PCB:PlacePolygonPlane');
 
-    // Board.ViewManager_FullUpdate;  // removed — expensive on large boards; Altium auto-refreshes on user interaction
+    // Board.ViewManager_FullUpdate;  // removed, expensive on large boards; Altium auto-refreshes on user interaction
 
     Result := BuildSuccessResponse(RequestId,
         '{"interactive_tool_launched":true,'
         + '"layer":"' + EscapeJsonString(LayerStr) + '",'
         + '"net_name":"' + EscapeJsonString(NetStr) + '",'
-        + '"note":"Interactive polygon placement tool launched. Requires user to draw the polygon boundary in Altium Designer — no polygon is created by this call."}');
+        + '"note":"Interactive polygon placement tool launched. Requires user to draw the polygon boundary in Altium Designer, no polygon is created by this call."}');
 End;
 
 {..............................................................................}
@@ -2082,8 +2141,14 @@ Function PCB_CreateDesignRule(Params : String; RequestId : String) : String;
 Var
     Board : IPCB_Board;
     Rule : IPCB_Rule;
-    RuleTypeStr, RuleName, ValueStr, ScopeStr, NetScopeStr : String;
-    RuleValue, NetScopeVal : Integer;
+    RuleClear : IPCB_ClearanceConstraint;
+    RuleWidth : IPCB_MaxMinWidthConstraint;
+    RuleHole : IPCB_MaxMinHoleSizeConstraint;
+    RuleDiff : IPCB_DifferentialPairsRoutingRule;
+    RuleTypeStr, RuleName, ValueStr, MaxValueStr, FavoredValueStr : String;
+    ScopeStr, NetScopeStr, MaxUncoupStr : String;
+    RuleValue, MaxValue, FavoredValue, MaxUncoupVal, NetScopeVal : Integer;
+    HasMaxValue : Boolean;
     L : TLayer;
 Begin
     Board := GetPCBBoardAnywhere;
@@ -2096,6 +2161,9 @@ Begin
     RuleTypeStr := ExtractJsonValue(Params, 'rule_type');
     RuleName := ExtractJsonValue(Params, 'name');
     ValueStr := ExtractJsonValue(Params, 'value');
+    MaxValueStr := ExtractJsonValue(Params, 'max_value');
+    FavoredValueStr := ExtractJsonValue(Params, 'favored_value');
+    MaxUncoupStr := ExtractJsonValue(Params, 'max_uncoupled_length');
     ScopeStr := ExtractJsonValue(Params, 'scope');
     NetScopeStr := LowerCase(ExtractJsonValue(Params, 'net_scope'));
 
@@ -2110,60 +2178,108 @@ Begin
 
     { Map textual net_scope to the enum used by the rule object.                  }
     { Blank / "any_net" keeps prior default behavior. For clearance rules          }
-    { "different_nets" is the normal setting — same-net tracks touching pads      }
+    { "different_nets" is the normal setting, same-net tracks touching pads      }
     { of their own net should NOT count as a clearance violation.                  }
     If NetScopeStr = 'different_nets' Then
-        NetScopeVal := eNetScope_DifferentNets
+        NetScopeVal := eNetScope_DifferentNetsOnly
     Else If NetScopeStr = 'same_net' Then
-        NetScopeVal := eNetScope_SameNet
+        NetScopeVal := eNetScope_SameNetOnly
     Else
         NetScopeVal := eNetScope_AnyNet;
 
     RuleValue := StrToIntDef(ValueStr, 10);
 
+    { Independent max / favored values: when omitted, fall back to the legacy }
+    { 5x-min default for width/via_size so existing callers keep working. The }
+    { previous handler forced max = value * 5 unconditionally, which silently }
+    { clamped any Width rule's max to 25 mil when value was 5 mil and broke   }
+    { wider power-trace use cases.                                              }
+    HasMaxValue := MaxValueStr <> '';
+    MaxValue := StrToIntDef(MaxValueStr, RuleValue * 5);
+    FavoredValue := StrToIntDef(FavoredValueStr, RuleValue);
+    MaxUncoupVal := StrToIntDef(MaxUncoupStr, 1000);
+
+    { Constraint values are NOT properties of the base IPCB_Rule interface,    }
+    { they live on the per-kind subtypes (IPCB_ClearanceConstraint,            }
+    { IPCB_MaxMinWidthConstraint, IPCB_MaxMinHoleSizeConstraint, ...). DelphiScript  }
+    { needs the variable typed as the actual subtype to expose constraint      }
+    { setters; assigning to a base IPCB_Rule var and then writing Rule.Gap     }
+    { fails with "Undeclared identifier" on builds where IPCB_Rule does not    }
+    { surface the union of constraint properties (e.g. AD 26.5+).              }
+    { Indexed properties also use function-call form: RuleWidth.MinWidth(L)    }
+    { not RuleWidth.MinWidth[L], bracket form is rejected in DelphiScript.    }
+    Rule := Nil;
     PCBServer.PreProcess;
     Try
         If RuleTypeStr = 'clearance' Then
         Begin
-            Rule := PCBServer.PCBRuleFactory(eRule_Clearance);
-            Rule.Name := RuleName;
-            Rule.NetScope := NetScopeVal;
-            Rule.LayerKind := eRuleLayerKind_SameLayer;
-            Rule.Gap := MilsToCoord(RuleValue);
+            RuleClear := PCBServer.PCBRuleFactory(eRule_Clearance);
+            RuleClear.Name := RuleName;
+            RuleClear.NetScope := NetScopeVal;
+            RuleClear.LayerKind := eRuleLayerKind_SameLayer;
+            RuleClear.Gap := MilsToCoord(RuleValue);
             If ScopeStr <> '' Then
-                Rule.Scope1Expression := ScopeStr;
+                RuleClear.Scope1Expression := ScopeStr;
+            Rule := RuleClear;
         End
         Else If RuleTypeStr = 'width' Then
         Begin
-            Rule := PCBServer.PCBRuleFactory(eRule_MaxMinWidth);
-            Rule.Name := RuleName;
-            Rule.NetScope := NetScopeVal;
-            Rule.LayerKind := eRuleLayerKind_SameLayer;
+            RuleWidth := PCBServer.PCBRuleFactory(eRule_MaxMinWidth);
+            RuleWidth.Name := RuleName;
+            RuleWidth.NetScope := NetScopeVal;
+            RuleWidth.LayerKind := eRuleLayerKind_SameLayer;
             For L := MinLayer To MaxLayer Do
             Begin
-                Rule.MinWidth[L] := MilsToCoord(RuleValue);
-                Rule.MaxWidth[L] := MilsToCoord(RuleValue * 5);
-                Rule.FavoredWidth[L] := MilsToCoord(RuleValue);
+                RuleWidth.MinWidth(L) := MilsToCoord(RuleValue);
+                RuleWidth.MaxWidth(L) := MilsToCoord(MaxValue);
+                RuleWidth.FavoredWidth(L) := MilsToCoord(FavoredValue);
             End;
             If ScopeStr <> '' Then
-                Rule.Scope1Expression := ScopeStr;
+                RuleWidth.Scope1Expression := ScopeStr;
+            Rule := RuleWidth;
         End
         Else If RuleTypeStr = 'via_size' Then
         Begin
-            Rule := PCBServer.PCBRuleFactory(eRule_MaxMinHoleSize);
-            Rule.Name := RuleName;
-            Rule.NetScope := NetScopeVal;
-            Rule.LayerKind := eRuleLayerKind_SameLayer;
-            Rule.MinLimit := MilsToCoord(RuleValue);
-            Rule.MaxLimit := MilsToCoord(RuleValue * 5);
+            RuleHole := PCBServer.PCBRuleFactory(eRule_MaxMinHoleSize);
+            RuleHole.Name := RuleName;
+            RuleHole.NetScope := NetScopeVal;
+            RuleHole.LayerKind := eRuleLayerKind_SameLayer;
+            RuleHole.MinLimit := MilsToCoord(RuleValue);
+            RuleHole.MaxLimit := MilsToCoord(MaxValue);
             If ScopeStr <> '' Then
-                Rule.Scope1Expression := ScopeStr;
+                RuleHole.Scope1Expression := ScopeStr;
+            Rule := RuleHole;
+        End
+        Else If RuleTypeStr = 'differential_pairs' Then
+        Begin
+            { IPCB_DifferentialPairsRoutingRule exposes MinGap / MaxGap /     }
+            { PreferedGap (note SDK spelling: one 'r') as layer-indexed      }
+            { properties, and MaxUncoupledLength as a single scalar. value ->}
+            { MinGap, max_value -> MaxGap, favored_value -> PreferedGap. The }
+            { width constraints shown in the rule's descriptor come from a   }
+            { separate Width rule scoped to the diff pair, not from this    }
+            { interface; create that separately with rule_type='width' if   }
+            { needed.                                                          }
+            RuleDiff := PCBServer.PCBRuleFactory(eRule_DifferentialPairsRouting);
+            RuleDiff.Name := RuleName;
+            RuleDiff.NetScope := NetScopeVal;
+            RuleDiff.LayerKind := eRuleLayerKind_SameLayer;
+            For L := MinLayer To MaxLayer Do
+            Begin
+                RuleDiff.MinGap(L) := MilsToCoord(RuleValue);
+                RuleDiff.MaxGap(L) := MilsToCoord(MaxValue);
+                RuleDiff.PreferedGap(L) := MilsToCoord(FavoredValue);
+            End;
+            RuleDiff.MaxUncoupledLength := MilsToCoord(MaxUncoupVal);
+            If ScopeStr <> '' Then
+                RuleDiff.Scope1Expression := ScopeStr;
+            Rule := RuleDiff;
         End
         Else
         Begin
             PCBServer.PostProcess;
             Result := BuildErrorResponse(RequestId, 'INVALID_PARAM',
-                'Unknown rule_type: ' + RuleTypeStr + '. Use clearance, width, or via_size');
+                'Unknown rule_type: ' + RuleTypeStr + '. Use clearance, width, via_size, or differential_pairs');
             Exit;
         End;
 
@@ -2315,7 +2431,7 @@ Begin
             + '"hole_size":' + IntToStr(CoordToMils(Pad.HoleSize)) + ','
             + '"top_x_size":' + IntToStr(CoordToMils(Pad.TopXSize)) + ','
             + '"top_y_size":' + IntToStr(CoordToMils(Pad.TopYSize)) + ','
-            + '"rotation":' + FloatToStr(Pad.Rotation) + '}';
+            + '"rotation":' + FloatToJsonStr(Pad.Rotation) + '}';
         Inc(Count);
         Pad := GrpIter.NextPCBObject;
     End;
@@ -2875,7 +2991,7 @@ Begin
     Result := BuildSuccessResponse(RequestId,
         '{"deleted":true,'
         + '"object_type":"' + EscapeJsonString(ObjTypeStr) + '",'
-        + '"distance_mils":' + FloatToStr(BestDist) + '}');
+        + '"distance_mils":' + FloatToJsonStr(BestDist) + '}');
 End;
 
 {..............................................................................}
@@ -2977,7 +3093,7 @@ Begin
             + '"top_x_size":' + IntToStr(CoordToMils(Pad.TopXSize)) + ','
             + '"top_y_size":' + IntToStr(CoordToMils(Pad.TopYSize)) + ','
             + '"hole_size":' + IntToStr(CoordToMils(Pad.HoleSize)) + ','
-            + '"rotation":' + FloatToStr(Pad.Rotation) + ','
+            + '"rotation":' + FloatToJsonStr(Pad.Rotation) + ','
             + '"is_smd":' + BoolToJsonStr(Pad.IsSurfaceMount) + ','
             + '"solder_mask_expansion":' + IntToStr(SolderMask) + ','
             + '"paste_mask_expansion":' + IntToStr(PasteMask) + '}';
@@ -3099,9 +3215,9 @@ Begin
     Count := 0;
 
     { Filtering only on eConnectionObject hangs because Altium treats it as a  }
-    { request for a fresh ratsnest — it rebuilds connectivity from scratch.    }
+    { request for a fresh ratsnest, it rebuilds connectivity from scratch.    }
     { Using the multi-type filter (same as PCB_GetBoardStatistics) is ~1000x  }
-    { faster — only walks primitives Altium already holds in memory.           }
+    { faster, only walks primitives Altium already holds in memory.           }
     Iterator := Board.BoardIterator_Create;
     Iterator.AddFilter_ObjectSet(MkSet(eTrackObject, eViaObject, ePadObject,
         eComponentObject, eFillObject, eTextObject, ePolyObject, eConnectionObject));
@@ -3160,13 +3276,6 @@ Begin
     FinalResp := BuildSuccessResponse(RequestId,
         '{"unrouted_nets":[' + JsonItems + '],"net_count":' + IntToStr(NetTotal)
         + ',"total_unrouted":' + IntToStr(Count) + '}');
-
-    { DelphiScript corrupts long string Result values on return from this     }
-    { handler — the caller gets the RequestId argument instead of the JSON.  }
-    { Bypass: write the response file directly here and set the sentinel     }
-    { that tells Dispatcher.ProcessSingleRequest to skip its own write.       }
-    WriteFileContent(WorkspaceDir + RESPONSE_FILE, FinalResp);
-    ResponseAlreadyWritten := True;
     Result := FinalResp;
 End;
 
@@ -3366,6 +3475,7 @@ Var
     Board : IPCB_Board;
     Iterator : IPCB_BoardIterator;
     Rule : IPCB_Rule;
+    Room : IPCB_ConfinementConstraint;
     JsonItems, KindStr : String;
     BR : TCoordRect;
     First : Boolean;
@@ -3395,14 +3505,17 @@ Begin
             If Not First Then JsonItems := JsonItems + ',';
             First := False;
 
+            { BoundingRect / Kind / Comment etc. live on IPCB_ConfinementConstraint, }
+            { not on the base IPCB_Rule. Narrow the typed reference before reading. }
+            Room := Rule;
             Try
-                BR := Rule.BoundingRect;
+                BR := Room.BoundingRect;
             Except
                 BR.Left := 0; BR.Bottom := 0; BR.Right := 0; BR.Top := 0;
             End;
 
             Try
-                If Rule.Kind = eConfineIn Then KindStr := 'ConfineIn'
+                If Room.Kind = eConfineIn Then KindStr := 'ConfineIn'
                 Else KindStr := 'ConfineOut';
             Except KindStr := 'Unknown'; End;
 
@@ -3641,10 +3754,10 @@ Begin
         + '"text_count":' + IntToStr(TextCount) + ','
         + '"polygon_count":' + IntToStr(PolyCount) + ','
         + '"unrouted_connections":' + IntToStr(ConnCount) + ','
-        + '"total_trace_length_mils":' + FloatToStr(TotalTraceLen) + ','
-        + '"board_width_mils":' + FloatToStr(BoardWidth) + ','
-        + '"board_height_mils":' + FloatToStr(BoardHeight) + ','
-        + '"board_area_sq_mils":' + FloatToStr(BoardArea) + ','
+        + '"total_trace_length_mils":' + FloatToJsonStr(TotalTraceLen) + ','
+        + '"board_width_mils":' + FloatToJsonStr(BoardWidth) + ','
+        + '"board_height_mils":' + FloatToJsonStr(BoardHeight) + ','
+        + '"board_area_sq_mils":' + FloatToJsonStr(BoardArea) + ','
         + '"layer_count":' + IntToStr(LayerCount) + ','
         + '"board_name":"' + EscapeJsonString(ExtractFileName(Board.FileName)) + '"}');
 End;
@@ -3694,7 +3807,7 @@ Begin
             + '"comment":"' + EscapeJsonString(Comment) + '",'
             + '"x":' + IntToStr(CoordToMils(Comp.x)) + ','
             + '"y":' + IntToStr(CoordToMils(Comp.y)) + ','
-            + '"rotation":' + FloatToStr(Comp.Rotation) + ','
+            + '"rotation":' + FloatToJsonStr(Comp.Rotation) + ','
             + '"layer":"' + EscapeJsonString(LayerStr) + '",';
         If Comp.Layer = eTopLayer Then
             JsonItems := JsonItems + '"side":"Top"}'
@@ -3819,7 +3932,7 @@ Begin
         Polygon.Layer := GetLayerFromString(LayerStr);
 
         { Assign each corner as a full TPolySegment record, per the
-          verified pattern from Altium scripting reference examples —
+          verified pattern from Altium scripting reference examples;
           field-level writes through Segments[I] aren't supported. }
         Polygon.PointCount := 4;
         Seg.Kind := ePolySegmentLine;
@@ -3836,7 +3949,7 @@ Begin
         End;
 
         { PourOver controls whether the polygon pours over existing
-          same-net primitives (tracks/pads). Default true — matches the
+          same-net primitives (tracks/pads). Default true, matches the
           common "pour GND plane" case. }
         If (PourOverStr = '') Or (LowerCase(PourOverStr) = 'true') Then
             Polygon.PourOver := ePolygonPourOver_Same
@@ -4072,7 +4185,7 @@ Begin
 
         { IPCB_Region uses MainContour + SetOutlineContour (NOT the polygon
           Segments API). Pattern taken from the Altium-Designer-addons
-          scripting-reference CreatePCBObjects.PAS example — the contour
+          scripting-reference CreatePCBObjects.PAS example, the contour
           X[I]/Y[I] arrays are 1-based (not 0-based). }
         Contour := Region.MainContour.Replicate;
         Contour.Count := 4;

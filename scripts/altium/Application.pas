@@ -7,11 +7,13 @@
 Function App_Ping(RequestId : String) : String;
 Begin
     // Return the compiled-in SCRIPT_VERSION so Python can detect a stale
-    // Altium script cache. The Altium string here comes from whatever was
-    // compiled when the script project was last opened; the Python side
-    // reads the on-disk version and warns on mismatch.
+    // Altium script cache. cast_errors surfaces the silent-cast counter
+    // (see RecordCastError), non-zero at session end indicates an
+    // interface mismatch worth investigating.
     Result := BuildSuccessResponse(RequestId,
-        '{"pong":true,"script_version":"' + SCRIPT_VERSION + '"}');
+        '{"pong":true,"script_version":"' + SCRIPT_VERSION +
+        '","protocol_version":' + IntToStr(PROTOCOL_VERSION) +
+        ',"cast_errors":' + IntToStr(CastErrorCount) + '}');
 End;
 
 Function App_GetVersion(RequestId : String) : String;
@@ -130,7 +132,7 @@ Begin
     // RunProcess('WorkspaceManager:OpenObject') would load it but strip
     // any project association, producing a "free document" in the UI
     // (tab title shows the full absolute path instead of filename).
-    // Refuse the call if the doc isn't loaded — the caller must open
+    // Refuse the call if the doc isn't loaded, the caller must open
     // it in Altium first.
     ServerDoc := Client.GetDocumentByPath(FilePath);
     If ServerDoc = Nil Then
@@ -322,8 +324,8 @@ End;
 {                                                                               }
 { Params: kind (required, e.g. 'PCB' or 'SCH'),                                }
 {         file_path (required, absolute path where the doc should live),       }
-{         name (optional display name — defaults to the filename),             }
-{         add_to_project (optional bool — defaults to true)                    }
+{         name (optional display name, defaults to the filename),             }
+{         add_to_project (optional bool, defaults to true)                    }
 {..............................................................................}
 
 Function App_CreateDocument(Params : String; RequestId : String) : String;
@@ -368,7 +370,7 @@ Begin
       so DoFileSave('') becomes a no-op. SetFileName forces the path;
       ensure it's set before the save. If DoFileSave fails for any
       reason, fall back to WorkspaceManager:SaveObject with an explicit
-      FileName — that path is effectively Save-As, which is what we
+      FileName, that path is effectively Save-As, which is what we
       want for a previously-unsaved document. }
     Saved := False;
     Try ServerDoc.SetFileName(FilePath); Except End;
@@ -389,9 +391,11 @@ Begin
         Except Saved := False; End;
     End;
 
-    { Add to the focused project via WorkspaceManager:AddDocumentToProject.
-      The process reads DocumentPath from parameters and attaches the file
-      to whatever project is currently focused. }
+    { Add to the focused project via IProject.DM_AddSourceDocument.            }
+    { The earlier RunProcess('WorkspaceManager:AddDocumentToProject') path     }
+    { silently no-ops in some workspace states, DM_AddSourceDocument is the  }
+    { documented project-side API and is what working examples in the         }
+    { reference/altium-delphiscripts-brett repo use.                          }
     Added := False;
     If AddToProject Then
     Begin
@@ -402,9 +406,7 @@ Begin
             If Project <> Nil Then
             Begin
                 Try
-                    ResetParameters;
-                    AddStringParameter('DocumentPath', FilePath);
-                    RunProcess('WorkspaceManager:AddDocumentToProject');
+                    Project.DM_AddSourceDocument(FilePath);
                     Added := True;
                 Except Added := False; End;
             End;
@@ -425,11 +427,71 @@ End;
 Function App_SaveAll(RequestId : String) : String;
 Begin
     Try
+        // Iterate every IServerDocument the editor has open and DoFileSave
+        // each modified one. This bypasses WorkspaceManager:SaveAll, which
+        // silently no-ops in some workspace states, and project-walk-based
+        // saves, which skip free documents.
         SaveAllDirty;
         Result := BuildSuccessResponse(RequestId, '{"saved":true}');
     Except
         Result := BuildErrorResponse(RequestId, 'SAVE_FAILED', 'SaveAllDirty raised an exception');
     End;
+End;
+
+{..............................................................................}
+{ Diagnostic: enumerate the workspace via FindFirst with the given pattern.    }
+{ Reports the FindFirst return code, the count of matches, and the first few  }
+{ filenames so we can confirm whether DelphiScript's directory enumeration    }
+{ actually works with our request_*.json convention.                          }
+{..............................................................................}
+
+Function App_DiagWorkspace(Params : String; RequestId : String) : String;
+Var
+    Pattern, Names, RawPattern, ExceptionMsg : String;
+    Files : TStringList;
+    Count, I : Integer;
+    First : Boolean;
+Begin
+    RawPattern := ExtractJsonValue(Params, 'pattern');
+    If RawPattern = '' Then RawPattern := 'request_*.json';
+    Pattern := RawPattern;
+
+    Count := 0;
+    Names := '';
+    First := True;
+    ExceptionMsg := '';
+
+    Try
+        Files := TStringList.Create;
+        Try
+            // FindFiles is the documented Altium DelphiScript helper for
+            // enumerating files in a directory; FindFirst from SysUtils is
+            // not exposed to scripts.
+            // Signature: FindFiles(folder, pattern, attr, recurse, list)
+            // attr=63 ($3F) is the standard "match anything" mask.
+            FindFiles(WorkspaceDir, Pattern, 63, False, Files);
+            Count := Files.Count;
+            For I := 0 To Files.Count - 1 Do
+            Begin
+                If I >= 10 Then Break;
+                If Not First Then Names := Names + ',';
+                First := False;
+                Names := Names + '"' + EscapeJsonString(ExtractFileName(Files[I])) + '"';
+            End;
+        Finally
+            Files.Free;
+        End;
+    Except
+        ExceptionMsg := 'FindFiles raised an exception';
+    End;
+
+    Result := BuildSuccessResponse(RequestId,
+        '{"workspace_dir":"' + EscapeJsonString(WorkspaceDir) +
+        '","pattern":"' + EscapeJsonString(Pattern) +
+        '","function":"FindFiles' +
+        '","match_count":' + IntToStr(Count) +
+        ',"first_matches":[' + Names +
+        '],"exception":"' + EscapeJsonString(ExceptionMsg) + '"}');
 End;
 
 Function HandleApplicationCommand(Action : String; Params : String; RequestId : String) : String;
@@ -446,6 +508,7 @@ Begin
         'get_clipboard_text':  Result := App_GetClipboardText(RequestId);
         'create_document':     Result := App_CreateDocument(Params, RequestId);
         'save_all':            Result := App_SaveAll(RequestId);
+        'diag_workspace':      Result := App_DiagWorkspace(Params, RequestId);
         'stop_server':         Begin SaveAllDirty; Running := False; Result := BuildSuccessResponse(RequestId, '{"stopped":true}'); End;
     Else
         Result := BuildErrorResponse(RequestId, 'UNKNOWN_ACTION', 'Unknown application action: ' + Action);

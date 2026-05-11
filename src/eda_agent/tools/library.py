@@ -113,7 +113,7 @@ def register_library_tools(mcp):
     ) -> dict[str, Any]:
         """Add a pin to the current symbol.
 
-        IMPORTANT — if you need to add more than one pin, use
+        IMPORTANT, if you need to add more than one pin, use
         `lib_add_pins` (batch) instead. Creating a new symbol with 20+
         pins via this singular tool is the biggest wall-time sink in
         library workflows: each pin is a full LLM turn. The batch
@@ -188,10 +188,10 @@ def register_library_tools(mcp):
                   pad. For BGAs with many GND/VCC balls, emit one entry
                   per ball with the same ``name`` and unique designators.
                 - name       (str, required)
-                - x, y       (int, mils) — pin endpoint
+                - x, y       (int, mils), pin endpoint
                 - length     (int, mils, default 200)
-                - rotation   (int, default 0) — 0/90/180/270
-                - electrical_type (str, default "passive") — one of
+                - rotation   (int, default 0), 0/90/180/270
+                - electrical_type (str, default "passive"), one of
                   input/output/bidirectional/passive/open_collector/
                   open_emitter/power/hiz/io
                 - hidden     (bool, default False)
@@ -691,7 +691,7 @@ def register_library_tools(mcp):
         before calling this.
 
         Args:
-            component_name: Name of the schematic component (currently ignored —
+            component_name: Name of the schematic component (currently ignored,
                 see note above)
             footprint_name: Name of the footprint to link
             footprint_library: Full path or filename of the .PcbLib that
@@ -728,18 +728,18 @@ def register_library_tools(mcp):
     ) -> dict[str, Any]:
         """Link a 3D model to a footprint.
 
-        NOTE: offset and rotation parameters are currently ignored by Altium —
+        NOTE: offset and rotation parameters are currently ignored by Altium;
         set them manually in the library after linking.
 
         Args:
             component_name: Name of the footprint
             model_path: Path to the 3D model file (.step, .stp)
-            offset_x: X offset in mils (ignored — see note)
-            offset_y: Y offset in mils (ignored — see note)
-            offset_z: Z offset in mils (ignored — see note)
-            rotation_x: X rotation in degrees (ignored — see note)
-            rotation_y: Y rotation in degrees (ignored — see note)
-            rotation_z: Z rotation in degrees (ignored — see note)
+            offset_x: X offset in mils (ignored, see note)
+            offset_y: Y offset in mils (ignored, see note)
+            offset_z: Z offset in mils (ignored, see note)
+            rotation_x: X rotation in degrees (ignored, see note)
+            rotation_y: Y rotation in degrees (ignored, see note)
+            rotation_z: Z rotation in degrees (ignored, see note)
 
         Returns:
             Dictionary confirming link
@@ -993,28 +993,64 @@ def register_library_tools(mcp):
     # =========================================================================
 
     @mcp.tool()
-    async def lib_get_components(library_path: Optional[str] = None) -> dict[str, Any]:
+    async def lib_get_components(
+        library_path: Optional[str] = None,
+        with_parameters: bool = False,
+    ) -> dict[str, Any]:
         """Get all components in a library.
+
+        Default fast path returns only the metadata that the
+        ``ILibCompInfoReader`` exposes directly: name, alias_name,
+        part_count, description. That path scales linearly with file IO
+        and finishes in well under a second on typical libraries.
+
+        Setting ``with_parameters=True`` adds each component's full
+        parameter dict (Manufacturer, Value, Footprint, etc.) to the
+        result. That branch calls ``GetState_SchComponentByLibRef`` once
+        per symbol and iterates parameters, which is O(N) in the live
+        SchLib document and is what makes the call slow on libraries
+        with many hundreds of components. Use it when you need the
+        parameters; for a single symbol's parameters, prefer
+        ``lib_get_component_details``.
 
         Args:
             library_path: Path to library (uses active library if not specified)
+            with_parameters: If True, include each component's parameter
+                dict (slow on large libraries). Default False.
 
         Returns:
-            Dictionary with "count" and "components" list
+            Dictionary with ``count`` and ``components`` list. Each
+            component carries name, alias_name, part_count, description,
+            and (only when with_parameters is True) parameters.
         """
         bridge = get_bridge()
-        params = {}
+        params: dict[str, Any] = {}
         if library_path:
             params["library_path"] = library_path
+        if with_parameters:
+            params["with_parameters"] = "true"
         result = await bridge.send_command_async("library.get_components", params)
+        if isinstance(result, dict):
+            return tag_response(
+                result, components=result, context="lib_get_components"
+            )
         return result or {}
 
     @mcp.tool()
     async def lib_search(
         query: str,
         search_type: str = "all",
+        library_path: Optional[str] = None,
+        limit: int = 100,
     ) -> dict[str, Any]:
-        """Search installed libraries for components.
+        """Search open SchLib documents for components.
+
+        Case-insensitive substring match. Walks every .SchLib that is
+        a member of any open project, plus every standalone .SchLib in
+        the workspace's free-documents area. Each library is read via
+        ``CreateLibCompInfoReader`` so the search is fast even with
+        many libraries open: it only loads symbols when ``search_type``
+        is ``"parameters"``.
 
         DATASHEET DISCIPLINE: Matches carry `_datasheet_guidance`.
         Before recommending any matched part as a replacement or
@@ -1022,17 +1058,33 @@ def register_library_tools(mcp):
         recommend based on symbol metadata alone.
 
         Args:
-            query: Search query string
-            search_type: What to search ("all", "name", "description", "parameters")
+            query: Substring to match against component name / alias /
+                description (case-insensitive).
+            search_type: ``"all"`` (default, matches name / alias /
+                description), ``"name"``, ``"description"``, or
+                ``"parameters"`` (slow, also walks each candidate's
+                parameter dict via the live symbol).
+            library_path: Optional path to a single .SchLib to restrict
+                the search to. When omitted, searches every open
+                library.
+            limit: Cap on returned matches (default 100).
 
         Returns:
-            Dict with matched components plus `_datasheet_guidance` +
+            Dict with ``query``, ``search_type``, ``count``, ``limit``,
+            ``truncated`` (True when count == limit), and ``results`` —
+            a list of {name, alias_name, description, library_path,
+            part_count} per match — plus `_datasheet_guidance` +
             `_datasheet_parts`.
         """
         bridge = get_bridge()
-        result = await bridge.send_command_async(
-            "library.search", {"query": query, "search_type": search_type}
-        )
+        params: dict[str, Any] = {
+            "query": query,
+            "search_type": search_type,
+            "limit": str(limit),
+        }
+        if library_path:
+            params["library_path"] = library_path
+        result = await bridge.send_command_async("library.search", params)
         if isinstance(result, list):
             result = {"results": result}
         if isinstance(result, dict):
@@ -1047,28 +1099,255 @@ def register_library_tools(mcp):
     @mcp.tool()
     async def lib_get_component_details(
         component_name: str,
-        library_path: str,
+        library_path: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Get detailed information about a library component.
+        """Get full inspection of one library component in a single call.
 
-        NOTE: Uses the focused library document, not library_path. Open the
-        target library in Altium before calling.
+        Returns metadata, every pin, every parameter (as a flat dict),
+        AND visual-style records for the designator, comment, pins,
+        and each parameter (font_id, color, is_hidden, x, y,
+        orientation, justification). The integer ``font_id`` can be
+        expanded to {name, size, bold, italic} via ``get_font_spec``
+        when style detail is needed; the round-trip default keeps it
+        compact.
+
+        If ``library_path`` is provided and isn't already focused, the
+        library is opened (focus changes), so the next ``lib_*`` call
+        operates on it without an explicit open. Saves are deferred,
+        opening doesn't write anything to disk.
+
+        DATASHEET DISCIPLINE: This response is the highest-density
+        device-fact surface in the library API (pins, parameters,
+        Manufacturer/MPN). Treat every value as a hint to find the
+        manufacturer datasheet, not as ground truth. The response
+        carries `_datasheet_guidance` and `_datasheet_parts`, fetch
+        the PDF and cite a section/page before stating any pin or
+        rating.
 
         Args:
-            component_name: Name of the component
-            library_path: Path to the library (currently ignored — see note)
+            component_name: Component LibRef as it appears in the .SchLib.
+            library_path: Optional .SchLib full path. When omitted the
+                currently focused library is used.
 
         Returns:
-            Dictionary with full component details. Includes ``part_count``
-            (number of functional parts; 1 for ordinary symbols, >1 for
-            multi-part symbols like quad op-amps).
+            Dict with:
+              - name, library_path, description, alias_name,
+                part_count, pin_count (number of functional parts;
+                1 for ordinary symbols, >1 for multi-part symbols
+                like quad op-amps).
+              - designator: {text, font_id, color, is_hidden, x, y,
+                orientation, justification} - the on-canvas designator
+                label (NOT just the prefix string).
+              - comment: {text, font_id, color, is_hidden, x, y,
+                orientation, justification} - the on-canvas comment /
+                value label.
+              - pins: list of {designator, name, electrical_type, x, y,
+                orientation, hidden, label_hidden}. Pin font / color
+                are not exposed by the Altium SDK on ISch_Pin and
+                therefore not surfaced here.
+              - parameters: flat dict of name -> value (cheap lookups).
+              - parameter_styles: list of {name, value, style:{font_id,
+                color, is_hidden, x, y, orientation, justification}}
+                in the same order parameters appear on the symbol.
+              - `_datasheet_guidance` + `_datasheet_parts`.
         """
         bridge = get_bridge()
+        params: dict[str, Any] = {"component_name": component_name}
+        if library_path:
+            params["library_path"] = library_path
         result = await bridge.send_command_async(
-            "library.get_component_details",
-            {"component_name": component_name, "library_path": library_path},
+            "library.get_component_details", params,
         )
+        if isinstance(result, dict):
+            mfr = ""
+            mpn = ""
+            params = result.get("parameters") or {}
+            if isinstance(params, dict):
+                mfr = str(
+                    params.get("Manufacturer")
+                    or params.get("manufacturer")
+                    or ""
+                ).strip()
+                mpn = str(
+                    params.get("ManufacturerPartNumber")
+                    or params.get("Manufacturer Part Number")
+                    or params.get("Partnumber")
+                    or params.get("PartNumber")
+                    or params.get("Comment")
+                    or ""
+                ).strip()
+            if not mpn:
+                mpn = str(result.get("name") or component_name or "").strip()
+            explicit = (
+                [{"manufacturer": mfr, "part_number": mpn, "designators": ""}]
+                if mpn
+                else []
+            )
+            return tag_response(
+                result,
+                explicit_parts=explicit,
+                context="lib_get_component_details",
+            )
         return result
+
+    @mcp.tool()
+    async def lib_audit_styles(
+        library_path: Optional[str] = None,
+        with_comment: bool = False,
+        with_parameters: bool = False,
+        with_pins: bool = False,
+        expect_designator_font_id: Optional[int] = None,
+        expect_designator_color: Optional[int] = None,
+        limit: int = 5000,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Bulk visual-style audit across every component in a library.
+
+        Walks the focused .SchLib (or one specified by ``library_path``)
+        component-by-component and emits each component's designator
+        style record. Comment / parameter_styles / pins are opt-in via
+        the ``with_*`` flags so the default response stays compact:
+        designator alone is ~120 bytes per component, so a 2000-symbol
+        library is ~240 KB without filters.
+
+        Filter mode: pass ``expect_designator_font_id`` and/or
+        ``expect_designator_color`` and the response only contains
+        components whose designator does NOT match the expected style.
+        That makes the audit case (find every symbol that doesn't use
+        Times New Roman 10pt navy) a single round-trip with bounded
+        output.
+
+        ``timeout`` overrides the bridge default. A 2000-symbol audit
+        with no opt-in flags finishes well under the 10s default; pass
+        a larger value if you flip on ``with_parameters`` and the lib
+        has heavy parameter dicts.
+
+        Args:
+            library_path: .SchLib path. Defaults to focused doc.
+            with_comment: Include comment style record per component.
+            with_parameters: Include parameter_styles array per component.
+            with_pins: Include pins array per component.
+            expect_designator_font_id: Filter; trim components where
+                designator.font_id equals this value.
+            expect_designator_color: Filter; trim components where
+                designator.color equals this BGR int (e.g. 8388608 for
+                navy / 0x000080 in BGR-packed form).
+            limit: Cap on emitted entries. Default 5000.
+            timeout: Per-call bridge poll timeout override (seconds).
+
+        Returns:
+            Dict with library_path, count (emitted), mismatch_count
+            (subset that failed the filter), limit, truncated,
+            filter_applied, and components: list of
+            {name, designator:{...}, mismatched, comment?:{...},
+             pins?:[...], parameter_styles?:[...]}.
+        """
+        bridge = get_bridge()
+        params: dict[str, Any] = {"limit": str(limit)}
+        if library_path:
+            params["library_path"] = library_path
+        if with_comment:
+            params["with_comment"] = "true"
+        if with_parameters:
+            params["with_parameters"] = "true"
+        if with_pins:
+            params["with_pins"] = "true"
+        if expect_designator_font_id is not None:
+            params["expect_designator_font_id"] = str(expect_designator_font_id)
+        if expect_designator_color is not None:
+            params["expect_designator_color"] = str(expect_designator_color)
+        result = await bridge.send_command_async(
+            "library.audit_styles", params, timeout=timeout,
+        )
+        return result or {}
+
+    @mcp.tool()
+    async def lib_set_label_format(
+        target: str = "designator",
+        font_id: Optional[int] = None,
+        color: Optional[int] = None,
+        is_hidden: Optional[bool] = None,
+        orientation: Optional[int] = None,
+        justification: Optional[int] = None,
+        component_name: Optional[str] = None,
+        library_path: Optional[str] = None,
+        only_mismatched: bool = True,
+        limit: int = 5000,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Bulk or single-component label-style writer for SchLib symbols.
+
+        Sets any subset of {font_id, color, is_hidden, orientation,
+        justification} on a target ISch_Label (designator, comment, or
+        a specific named parameter) for either one component
+        (``component_name`` set) or every component in the library
+        (``component_name`` omitted).
+
+        Symmetric counterpart to lib_audit_styles' filter mode: with
+        ``only_mismatched=True`` (default), components whose target
+        label already matches every supplied field are skipped, so
+        re-running the call after a partial application is idempotent.
+
+        The whole edit batch is wrapped in a single Altium undo step
+        and saves are deferred (`save_all` flushes the .SchLib).
+
+        Args:
+            target: Which label to format. ``"designator"`` (default),
+                ``"comment"``, or ``"parameter:<Name>"`` (e.g.,
+                ``"parameter:Manufacturer"``).
+            font_id: New font ID. Resolve via get_font_id /
+                get_font_spec if you need to convert from
+                {name, size, bold, italic}.
+            color: New BGR-packed color int. Navy ``#000080`` is
+                ``8388608`` (0x800000 in BGR).
+            is_hidden: Hide / show the label.
+            orientation: 0/90/180/270 (Altium's TRotationBy90 enum).
+            justification: Altium label justification enum.
+            component_name: When set, applies only to that one
+                component. Omit for bulk-walk.
+            library_path: .SchLib path. Defaults to focused doc.
+            only_mismatched: When True (default) skip components
+                already matching the target style. Set False to
+                rewrite unconditionally.
+            limit: Cap on processed components in bulk mode.
+            timeout: Per-call bridge poll timeout override.
+
+        Returns:
+            Dict with library_path, target, scope ("single"|"bulk"),
+            total, modified, already_compliant, missing_target,
+            failed, limit, truncated.
+        """
+        if (font_id is None and color is None and is_hidden is None
+                and orientation is None and justification is None):
+            raise InvalidParameterError(
+                "At least one of font_id / color / is_hidden / "
+                "orientation / justification must be supplied"
+            )
+        bridge = get_bridge()
+        params: dict[str, Any] = {
+            "target": target,
+            "limit": str(limit),
+        }
+        if font_id is not None:
+            params["font_id"] = str(font_id)
+        if color is not None:
+            params["color"] = str(color)
+        if is_hidden is not None:
+            params["is_hidden"] = "true" if is_hidden else "false"
+        if orientation is not None:
+            params["orientation"] = str(orientation)
+        if justification is not None:
+            params["justification"] = str(justification)
+        if component_name:
+            params["component_name"] = component_name
+        if library_path:
+            params["library_path"] = library_path
+        if not only_mismatched:
+            params["only_mismatched"] = "false"
+        result = await bridge.send_command_async(
+            "library.set_label_format", params, timeout=timeout,
+        )
+        return result or {}
 
     @mcp.tool()
     async def lib_batch_set_params(
@@ -1805,18 +2084,37 @@ def register_library_tools(mcp):
     async def lib_get_pin_list() -> dict[str, Any]:
         """Get all pins of the current library component.
 
+        DATASHEET DISCIPLINE: Pin name + electrical_type from the
+        symbol can be wrong, especially on libraries that have been
+        edited by hand or imported from third-party sources. Before
+        relying on a pin's function for any decision, fetch the
+        manufacturer datasheet and verify against its pin-description
+        table. The response carries `_datasheet_guidance` +
+        `_datasheet_parts`.
+
         Returns:
             Dictionary with "count", "component" name, "part_count" (total
             functional parts in the component — 1 for ordinary symbols),
             and "pins" array. Each pin has: designator, name,
             electrical_type, x, y, orientation, hidden, owner_part_id
             (1..N picks which part the pin belongs to; 0 means shared
-            across all parts).
+            across all parts). Plus `_datasheet_guidance` +
+            `_datasheet_parts`.
         """
         bridge = get_bridge()
         result = await bridge.send_command_async(
             "library.get_pin_list", {}
         )
+        if isinstance(result, dict):
+            comp = str(result.get("component") or "").strip()
+            explicit = (
+                [{"manufacturer": "", "part_number": comp, "designators": ""}]
+                if comp
+                else []
+            )
+            return tag_response(
+                result, explicit_parts=explicit, context="lib_get_pin_list"
+            )
         return result
 
     @mcp.tool()

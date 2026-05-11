@@ -14,19 +14,27 @@ from .datasheet_hints import DATASHEET_RULES
 _VERSION_RE = re.compile(r"SCRIPT_VERSION\s*=\s*'([^']+)'")
 
 _SESSION_REMINDER = {
-    "title": "Datasheet discipline — read before every design decision",
+    "__DATASHEET_FIRST__": (
+        "MANDATORY for this whole session: every device-related "
+        "claim (pin function, pin number, rating, package, "
+        "polarity, register, timing, threshold, behaviour, "
+        "footprint pad map) requires the manufacturer datasheet, "
+        "fetched and cited, BEFORE the answer. No exceptions. No "
+        "'I'll assume'. No leaning on Comment / Description / "
+        "Value, distributor copy, or prior-turn memory. WebSearch "
+        "+ WebFetch the manufacturer PDF first, then answer with "
+        "a section/page citation."
+    ),
+    "title": "Datasheet discipline, mandatory before every device-related claim",
     "rule": (
-        "For any question about a component's pin function, voltage "
-        "rating, timing, current limit, or electrical behavior, the "
+        "For ANY question that touches a real device (IC, sensor, "
+        "regulator, MOSFET, connector, passive, anything), the "
         "manufacturer datasheet is the only authoritative source. "
-        "Library symbol metadata (Description, Comment, Value) can "
-        "be wrong and must not be trusted. If the datasheet for a "
-        "referenced part is not already in the conversation, use "
-        "WebSearch + WebFetch to fetch it from the vendor before "
-        "drawing conclusions. Never fabricate or guess datasheet-"
-        "derived values. Tool responses that surface component "
-        "information carry a `_datasheet_guidance` block with per-"
-        "part search queries — use them."
+        "Symbol metadata can be wrong, distributor pages can be "
+        "wrong, your own prior-turn memory can be wrong. The "
+        "datasheet is ground truth. Tool responses that surface "
+        "component information carry a `_datasheet_guidance` "
+        "block, treat it as a checklist, not an FYI."
     ),
     "datasheet_rules": DATASHEET_RULES,
 }
@@ -36,7 +44,7 @@ _SESSION_REMINDER = {
 def _bundled_script_version() -> Optional[str]:
     """Read SCRIPT_VERSION from the bundled Main.pas.
 
-    Returns None if the file can't be found or parsed — in which case we
+    Returns None if the file can't be found or parsed, in which case we
     skip the stale-cache comparison and just report whatever Altium
     reported.
     """
@@ -85,7 +93,7 @@ def register_application_tools(mcp):
             return {
                 "attached": True,
                 "script_loaded": script_loaded,
-                "message": "Connected to Altium Designer — script is responding"
+                "message": "Connected to Altium Designer, script is responding"
                 if script_loaded
                 else "Altium is running but script is not responding. Run StartMCPServer in Altium_API.PrjScr.",
                 "_system_reminder": _SESSION_REMINDER,
@@ -105,8 +113,8 @@ def register_application_tools(mcp):
         Mutation tools (pcb_place_tracks, move_component, modify_objects, ...)
         now mark documents as modified in-memory only. Changes stay fast
         because they skip per-operation disk writes. Call save_all at logical
-        checkpoints — after a routing pass, before running DRC, or before
-        closing — to persist everything.
+        checkpoints, after a routing pass, before running DRC, or before
+        closing, to persist everything.
 
         Detach also triggers save_all automatically, so you don't need this
         as the very last step.
@@ -126,7 +134,7 @@ def register_application_tools(mcp):
 
         While the eda-agent MCP server is connected, a keep-alive thread pings
         Altium every 30 s, which keeps Altium's scripting engine held by the
-        polling loop — Altium's own script-backed UI commands (some ribbon
+        polling loop, Altium's own script-backed UI commands (some ribbon
         buttons, Parameter Manager actions, etc.) may be unresponsive until the
         loop is released.
 
@@ -166,14 +174,14 @@ def register_application_tools(mcp):
 
         Also reads SCRIPT_VERSION from the .pas that Altium has compiled
         and compares it to the version in the bundled on-disk Main.pas.
-        A mismatch means Altium is running a stale cached script — close
+        A mismatch means Altium is running a stale cached script, close
         and reopen Altium_API.PrjScr (or restart Altium) to recompile.
 
         Returns:
             Dictionary with:
             - success: True if Altium responded
             - mcp_server_version: version of this eda-agent Python package
-              (from `eda_agent.__version__`) — identifies the MCP server
+              (from `eda_agent.__version__`), identifies the MCP server
               process currently handling tool calls
             - altium_script_version: version the running script reports
               (empty string if the script is too old to report it)
@@ -250,7 +258,7 @@ def register_application_tools(mcp):
         update_pcb, to spin up a fresh .SchDoc, library, OutJob, etc.
 
         Args:
-            kind: Document kind — 'PCB', 'SCH', 'PCBLIB', 'SCHLIB',
+            kind: Document kind, 'PCB', 'SCH', 'PCBLIB', 'SCHLIB',
                 'OUTPUTJOB', or any other kind Altium's server module
                 registers under.
             file_path: Absolute path where the new document should live.
@@ -283,7 +291,7 @@ def register_application_tools(mcp):
         carries a `loaded` flag that distinguishes "listed as project
         member on disk" from "actually resident in the editor".
         Project-scope queries (query_objects, batch_modify, ...) only
-        iterate loaded sheets — if `loaded` is false for sheets you need
+        iterate loaded sheets, if `loaded` is false for sheets you need
         to hit, call load_project_sheets first.
 
         Returns:
@@ -298,6 +306,21 @@ def register_application_tools(mcp):
         bridge = get_bridge()
         result = await bridge.send_command_async("application.get_open_documents")
         return result
+
+    @mcp.tool()
+    async def diag_workspace(pattern: str = "request_*.json") -> dict[str, Any]:
+        """Diagnostic: enumerate workspace files via Altium's FindFiles helper.
+
+        Reports workspace_dir, the pattern used, match_count and the first
+        10 matching filenames. Used to validate the per-request file
+        enumeration that the dispatcher relies on.
+        """
+        bridge = get_bridge()
+        return await bridge.send_command_async(
+            "application.diag_workspace",
+            {"pattern": pattern},
+            timeout=10.0,
+        )
 
     @mcp.tool()
     async def get_active_document() -> dict[str, Any]:
